@@ -1,54 +1,52 @@
 import cv2
-import time
 from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
+import os
+import sys
 from pathfinding.core.grid import Grid
 from pathfinding.finder.a_star import AStarFinder
 from PIL import Image, ImageDraw, ImageFont
-import os
-import sys
 
 
 class VideMosaic:
-    """This class processes every frame and generates the panorama
+    # def __init__(self, first_image, output_height_times=2, output_width_times=4, detector_type="sift"):
+    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift"):
+        """This class processes every frame and generates the panorama
 
-    Args:
-        first_image (image for the first frame): first image to initialize the output size
-        output_height_times (int, optional): determines the output height based on input image height. Defaults to 2.
-        output_width_times (int, optional): determines the output width based on input image width. Defaults to 4.
-        detector_type (str, optional): the detector for feature detection. It can be "sift" or "orb". Defaults to "sift".
-    """
-    def __init__(self, first_image, output_height_times=1, output_width_times=4, detector_type="sift", update_callback=None, show_intermediate=True):
-        self.update_callback = update_callback
+        Args:
+            first_image (image for the first frame): first image to initialize the output size
+            output_height_times (int, optional): determines the output height based on input image height. Defaults to 2.
+            output_width_times (int, optional): determines the output width based on input image width. Defaults to 4.
+            detector_type (str, optional): the detector for feature detection. It can be "sift" or "orb". Defaults to "sift".
+        """
         self.detector_type = detector_type
-        self.show_intermediate = show_intermediate
-        self.quit_requested = False
         if detector_type == "sift":
-            # Keep feature count moderate to avoid excessive memory use
-            self.detector = cv2.SIFT_create(300)
+            self.detector = cv2.SIFT_create(700)
             self.bf = cv2.BFMatcher()
         elif detector_type == "orb":
             self.detector = cv2.ORB_create(700)
             self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        # enable visualization for intermediate results
         self.visualize = True
 
         # Initialize YOLO model for detection with larger model for better accuracy
         try:
-            self.model = YOLO('yolov8l.pt')  # Using large model for maximum detection quality
+            self.model = YOLO('yolov8n.pt')  # Using large model for maximum detection quality
         except Exception as e:
             print(f"Warning: failed to load YOLO model: {e}")
             self.model = None
 
         self.process_first_frame(first_image)
 
-        self.output_img = np.zeros(shape=(int(output_height_times * first_image.shape[0]), int(output_width_times * first_image.shape[1]), first_image.shape[2]), dtype=np.uint8)
+        self.output_img = np.zeros(shape=(int(output_height_times * first_image.shape[0]), int(
+            output_width_times*first_image.shape[1]), first_image.shape[2]))
 
-        # offsets to place first image at left
-        self.w_offset = 0
-        self.h_offset = 0
+        # offset
+        # self.w_offset = int(self.output_img.shape[0]/2 - first_image.shape[0]/2)
+        # self.h_offset = int(self.output_img.shape[1]/2 - first_image.shape[1]/2)
+        self.w_offset = int(self.output_img.shape[0]/1 - first_image.shape[0]/1)
+        self.h_offset = int(self.output_img.shape[1]/2 - first_image.shape[1]/2)
 
         self.output_img[self.w_offset:self.w_offset+first_image.shape[0],
                         self.h_offset:self.h_offset+first_image.shape[1], :] = first_image
@@ -56,12 +54,6 @@ class VideMosaic:
         self.H_old = np.eye(3)
         self.H_old[0, 2] = self.h_offset
         self.H_old[1, 2] = self.w_offset
-        
-        # Initialize OpenCV window for intermediate visualization if enabled
-        if self.show_intermediate:
-            cv2.namedWindow('Mosaic Progress', cv2.WINDOW_FULLSCREEN)
-            cv2.namedWindow('Current Frame', cv2.WINDOW_AUTOSIZE)
-            print("OpenCV windows 'Mosaic Progress' and 'Current Frame' created")
 
     def process_first_frame(self, first_image):
         """processes the first frame for feature detection and description
@@ -118,38 +110,60 @@ class VideMosaic:
         return detections
 
     def match(self, des_cur, des_prev):
-        if des_cur is None or des_prev is None:
-            return []
+        """matches the descriptors
+
+        Args:
+            des_cur (np array): current frame descriptor
+            des_prev (np arrau): previous frame descriptor
+
+        Returns:
+            array: and array of matches between descriptors
+        """
+        # matching
         if self.detector_type == "sift":
             pair_matches = self.bf.knnMatch(des_cur, des_prev, k=2)
             matches = []
             for m, n in pair_matches:
                 if m.distance < 0.7*n.distance:
                     matches.append(m)
+
         elif self.detector_type == "orb":
             matches = self.bf.match(des_cur, des_prev)
+
+        # Sort them in the order of their distance.
         matches = sorted(matches, key=lambda x: x.distance)
+
+        # get the maximum of 20  best matches
         matches = matches[:min(len(matches), 20)]
+        # Draw first 10 matches.
+        if self.visualize:
+            match_img = cv2.drawMatches(self.frame_cur, self.kp_cur, self.frame_prev, self.kp_prev, matches, None,
+                                        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+            cv2.namedWindow('matches', cv2.WINDOW_NORMAL)
+            cv2.imshow('matches', match_img)
         return matches
 
     def process_frame(self, frame_cur, frame_count):
+        """gets an image and processes that image for mosaicing
+
+        Args:
+            frame_cur (np array): input of current frame for the mosaicing
+        """
         self.frame_cur = frame_cur
         frame_gray_cur = cv2.cvtColor(frame_cur, cv2.COLOR_BGR2GRAY)
         self.kp_cur, self.des_cur = self.detector.detectAndCompute(frame_gray_cur, None)
+
         self.matches = self.match(self.des_cur, self.des_prev)
-        print(f"Frame {frame_count}: matches = {len(self.matches)}")
+
         if len(self.matches) < 4:
-            # Display current mosaic state even if frame registration fails
-            if self.show_intermediate:
-                cv2.imshow('Mosaic Progress', self.output_img)
-                cv2.imshow('Current Frame', self.frame_cur)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    self.quit_requested = True
-                    return
             return
+
         self.H = self.findHomography(self.kp_cur, self.kp_prev, self.matches)
         self.H = np.matmul(self.H_old, self.H)
+        # TODO: check for bad Homography
+
         self.warp(self.frame_cur, self.H)
+
         people_boxes = self.detect_people(self.frame_cur)
         for box in people_boxes:
             x1, y1, x2, y2 = box
@@ -169,71 +183,102 @@ class VideMosaic:
         if detections:
             os.makedirs('Detections', exist_ok=True)
             cv2.imwrite(os.path.join('Detections', f'frame_{frame_count}.jpg'), self.frame_cur)
+
+        # loop preparation
         self.H_old = self.H
         self.kp_prev = self.kp_cur
         self.des_prev = self.des_cur
         self.frame_prev = self.frame_cur
-        self.last_frame = self.frame_cur.copy()
-        
-        # Display current mosaic state if visualization is enabled
-        if self.show_intermediate:
-            cv2.imshow('Mosaic Progress', self.output_img)
-            cv2.imshow('Current Frame', self.frame_cur)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                self.quit_requested = True
-                return
-            elif key == 27:  # ESC key
-                self.quit_requested = True
-                return
 
     @ staticmethod
     def findHomography(image_1_kp, image_2_kp, matches):
+        """gets two matches and calculate the homography between two images
+
+        Args:
+            image_1_kp (np array): keypoints of image 1
+            image_2_kp (np_array): keypoints of image 2
+            matches (np array): matches between keypoints in image 1 and image 2
+
+        Returns:
+            np arrat of shape [3,3]: Homography matrix
+        """
+        # taken from https://github.com/cmcguinness/focusstack/blob/master/FocusStack.py
+
         image_1_points = np.zeros((len(matches), 1, 2), dtype=np.float32)
         image_2_points = np.zeros((len(matches), 1, 2), dtype=np.float32)
         for i in range(0, len(matches)):
             image_1_points[i] = image_1_kp[matches[i].queryIdx].pt
             image_2_points[i] = image_2_kp[matches[i].trainIdx].pt
-        homography, mask = cv2.findHomography(image_1_points, image_2_points, cv2.RANSAC, ransacReprojThreshold=2.0)
+
+        homography, mask = cv2.findHomography(
+            image_1_points, image_2_points, cv2.RANSAC, ransacReprojThreshold=2.0)
+
         return homography
 
     def warp(self, frame_cur, H):
+        """ warps the current frame based of calculated homography H
+
+        Args:
+            frame_cur (np array): current frame
+            H (np array of shape [3,3]): homography matrix
+
+        Returns:
+            np array: image output of mosaicing
+        """
         warped_img = cv2.warpPerspective(frame_cur, H, (self.output_img.shape[1], self.output_img.shape[0]), flags=cv2.INTER_LINEAR)
-        # transformed_corners = self.get_transformed_corners(frame_cur, H)
-        # warped_img = self.draw_border(warped_img, transformed_corners)
+
+        transformed_corners = self.get_transformed_corners(frame_cur, H)
+        warped_img = self.draw_border(warped_img, transformed_corners)
+
         self.output_img[warped_img > 0] = warped_img[warped_img > 0]
+        output_temp = np.copy(self.output_img)
+        output_temp = self.draw_border(output_temp, transformed_corners, color=(0, 0, 255))
+        
+        cv2.namedWindow('output', cv2.WINDOW_NORMAL)
+        cv2.imshow('output',  output_temp/255.)
+
         return self.output_img
 
     @ staticmethod
     def get_transformed_corners(frame_cur, H):
+        """finds the corner of the current frame after warp
+
+        Args:
+            frame_cur (np array): current frame
+            H (np array of shape [3,3]): Homography matrix 
+
+        Returns:
+            [np array]: a list of 4 corner points after warping
+        """
         corner_0 = np.array([0, 0])
         corner_1 = np.array([frame_cur.shape[1], 0])
         corner_2 = np.array([frame_cur.shape[1], frame_cur.shape[0]])
         corner_3 = np.array([0, frame_cur.shape[0]])
+
         corners = np.array([[corner_0, corner_1, corner_2, corner_3]], dtype=np.float32)
         transformed_corners = cv2.perspectiveTransform(corners, H)
+
         transformed_corners = np.array(transformed_corners, dtype=np.int32)
+        # mask = np.zeros(shape=(output.shape[0], output.shape[1], 1))
+        # cv2.fillPoly(mask, transformed_corners, color=(1, 0, 0))
+        # cv2.imshow('mask', mask)
+
         return transformed_corners
 
-    def draw_border(self, image, corners, color=(0, 0, 255)):
+    def draw_border(self, image, corners, color=(0, 0, 0)):
+        """This functions draw rectancle border
+
+        Args:
+            image ([type]): current mosaiced output
+            corners (np array): list of corner points
+            color (tuple, optional): color of the border lines. Defaults to (0, 0, 0).
+
+        Returns:
+            np array: the output image with border
+        """
         for i in range(corners.shape[1]-1, -1, -1):
             cv2.line(image, tuple(corners[0, i, :]), tuple(corners[0, i-1, :]), thickness=5, color=color)
         return image
-
-
-
-
-
-def is_path_clear(x1, y1, x2, y2, obstacles):
-    num_samples = 20
-    for i in range(num_samples + 1):
-        t = i / num_samples
-        px = int(x1 + t * (x2 - x1))
-        py = int(y1 + t * (y2 - y1))
-        if 0 <= px < obstacles.shape[1] and 0 <= py < obstacles.shape[0]:
-            if obstacles[py, px] > 0:
-                return False
-    return True
 
 
 def crop_black_areas(image):
@@ -245,6 +290,41 @@ def crop_black_areas(image):
     return image[y:y+h, x:x+w]
 
 
+def scale_to_screen(image, target_w=None, target_h=None):
+    """Scale image to target size (defaults to primary screen size on Windows) while preserving aspect ratio.
+
+    Returns the scaled image (may be larger than original).
+    """
+    ih, iw = image.shape[0], image.shape[1]
+    # Try to get Windows primary screen size
+    screen_w = target_w
+    screen_h = target_h
+    if screen_w is None or screen_h is None:
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            screen_w = user32.GetSystemMetrics(0)
+            screen_h = user32.GetSystemMetrics(1)
+        except Exception:
+            # fallback
+            screen_w, screen_h = 1920, 1080
+
+    # Compute scale keeping aspect
+    scale = min(max(1.0, screen_w / float(iw)), max(1.0, screen_h / float(ih)))
+    # Use the minimal upscaling factor that fits either width or height
+    # but keep aspect ratio: choose scale such that image fits screen in at least one dimension
+    scale_w = screen_w / float(iw)
+    scale_h = screen_h / float(ih)
+    scale = min(scale_w, scale_h)
+    if scale <= 0:
+        scale = 1.0
+
+    new_w = max(1, int(iw * scale))
+    new_h = max(1, int(ih * scale))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return resized
+
+
 def draw_dotted_line(img, pt1, pt2, color, thickness):
     dist = ((pt2[0] - pt1[0]) ** 2 + (pt2[1] - pt1[1]) ** 2) ** 0.5
     num_dots = max(1, int(dist / 10))
@@ -253,102 +333,6 @@ def draw_dotted_line(img, pt1, pt2, color, thickness):
         px = int(pt1[0] + t * (pt2[0] - pt1[0]))
         py = int(pt1[1] + t * (pt2[1] - pt1[1]))
         cv2.circle(img, (px, py), thickness, color, -1)
-
-
-def main(video_path=None, update_callback=None, show_intermediate=True):
-
-    if video_path is None:
-        video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
-    print(f"Opening video file: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Ошибка: Не удалось открыть видеофайл")
-        return
-
-    # Create Detections folder
-    os.makedirs('Detections', exist_ok=True)
-
-    # Get total frame count for progress calculation
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames in video: {total_frames}")
-    frame_count = 0
-    is_first_frame = True
-    print("Starting video processing and mosaic formation...")
-    
-    while cap.isOpened():
-        ret, frame_cur = cap.read()
-        if not ret:
-            if is_first_frame:
-                continue
-            break
-
-        if is_first_frame:
-            video_mosaic = VideMosaic(frame_cur, detector_type="sift", update_callback=update_callback, show_intermediate=show_intermediate)
-            is_first_frame = False
-            continue
-
-        frame_count += 1
-        # process each frame
-        video_mosaic.process_frame(frame_cur, frame_count)
-        
-        # Print progress every 50 frames
-        if frame_count % 50 == 0:
-            progress = (frame_count / total_frames) * 100
-            print(f"Processed frame {frame_count}/{total_frames} ({progress:.1f}%)")
-        
-        # Check if user requested to quit during processing
-        if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
-            print("Processing interrupted by user.")
-            break
-        
-        # Update progress if callback is provided
-        if update_callback:
-            progress = (frame_count / total_frames) * 100
-            update_callback(frame_count, video_mosaic.output_img.copy(), progress)
-            
-    cap.release()
-    print("Video processing completed. Mosaic formed.")
-    
-    # Keep the final mosaic displayed until user closes it
-    if show_intermediate:
-        print("Final mosaic completed. Press any key to close the window.")
-        cv2.imshow('Mosaic Progress', video_mosaic.output_img)
-        cv2.waitKey(0)  # Wait for any key press
-        cv2.destroyAllWindows()
-    else:
-        cv2.destroyAllWindows()
-        
-    print("Saving mosaic image...")
-    cv2.imwrite('mosaic.jpg', video_mosaic.output_img)
-    print("Mosaic saved as 'mosaic.jpg'")
-
-    # Detect objects on the mosaic
-    print("Detecting objects on the mosaic...")
-    detections = video_mosaic.detect_objects(video_mosaic.output_img.astype(np.uint8))
-    print(f"Detected {len(detections)} objects on the mosaic.")
-
-    # Optionally analyze mosaic for navigation: mark obstacles and draw paths to objects
-    # Commenting out the navigation map creation as per user request
-    print("Analyzing mosaic for navigation...")
-    navigation_map = analyze_for_navigation(video_mosaic.output_img.astype(np.uint8), detections)
-    print("Saving navigation map...")
-    cv2.imwrite('navigation_map.jpg', navigation_map)
-    print("Navigation map saved as 'navigation_map.jpg'")
-    if show_intermediate:
-        cv2.imshow('Navigation Map', navigation_map)
-        print("Navigation map displayed. Press any key in the window to continue.")
-    
-    # Close all OpenCV windows at the end of the program
-    cv2.destroyAllWindows()
-    
-    # Check if processing was interrupted by user
-    if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
-        print("Video mosaic generation was interrupted by user.")
-        return
-    
-    # Final update with completion
-    if update_callback:
-        update_callback(frame_count, video_mosaic.output_img.copy(), 100)
 
 
 def analyze_for_navigation(frame, detections, start_point=None):
@@ -380,9 +364,6 @@ def analyze_for_navigation(frame, detections, start_point=None):
     nav_map = frame.copy()
     contours, _ = cv2.findContours(obstacles, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(nav_map, contours, -1, (0, 0, 255), 2)  # Red contours for obstacles
-
-    # interactive start selection with separate OpenCV window was removed
-    # Use GUIApp.toggle_set_start and click on the navigation canvas to set a start point in-app.
 
     # default center point (bottom-center) unless provided by GUI
     default_start = (frame.shape[1] // 2, frame.shape[0] - 50)
@@ -450,7 +431,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
             cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow for objects
 
     # --- New: detect building-like targets on the mosaic (rectangular, large contours)
-    def detect_buildings(img, min_area=200):
+    def detect_buildings(img, min_area=100):
         # Try a more robust multi-step approach to find large man-made rectangular shapes
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -468,6 +449,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
         edges = cv2.Canny(closed, 30, 120)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         buildings = []
+        print(f"Found {len(contours)} contours")
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area:
@@ -482,6 +464,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
             # Accept roughly rectangular-ish large contours OR tall/wide boxes
             if fill_ratio > 0.1 and w > 10 and h > 10 and len(approx) >= 4 and len(approx) <= 8:
                 buildings.append((x, y, x + w, y + h))
+        print(f"Detected {len(buildings)} buildings")
         return buildings
 
     # Build a downsampled occupancy grid and use A* to route.
@@ -618,6 +601,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
 
     return nav_map
 
+
 def is_path_clear(x1, y1, x2, y2, obstacles):
     """Check if the line between two points avoids obstacles."""
     # Simple check: sample points along the line
@@ -631,29 +615,57 @@ def is_path_clear(x1, y1, x2, y2, obstacles):
                 return False
     return True
 
-def crop_black_areas(image):
-    """Crop black areas from the image."""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Find non-zero pixels
-    coords = cv2.findNonZero(gray)
-    if coords is None:
-        return image
-    x, y, w, h = cv2.boundingRect(coords)
-    return image[y:y+h, x:x+w]
 
-def draw_dotted_line(img, pt1, pt2, color, thickness):
-    """Draw a dotted line between two points."""
-    dist = ((pt2[0] - pt1[0]) ** 2 + (pt2[1] - pt1[1]) ** 2) ** 0.5
-    num_dots = int(dist / 10)
-    for i in range(num_dots):
-        t = i / num_dots
-        px = int(pt1[0] + t * (pt2[0] - pt1[0]))
-        py = int(pt1[1] + t * (pt2[1] - pt1[1]))
-        cv2.circle(img, (px, py), thickness, color, -1)
+def main():
+
+    # video_path = 'Data/rotate.mjpeg'
+    # video_path = 'Data/airplane01.mjpeg'
+    # video_path = 'Data/foglab3.mov'
+    video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
+    # video_path = "C:\\Users\\main\\Downloads\\поиски квадрокоптера 3 (360p).mp4"
+    cap = cv2.VideoCapture(video_path)
+    is_first_frame = True
+    frame_count = 0
+    first_frame_shape = None
+    cap.read()
+    while cap.isOpened():
+        ret, frame_cur = cap.read()
+        if not ret:
+            if is_first_frame:
+                continue
+            break
+
+        if is_first_frame:
+            first_frame_shape = frame_cur.shape[:2]
+            video_mosaic = VideMosaic(frame_cur, detector_type="sift")
+            is_first_frame = False
+            # Calculate start point as bottom center of first frame in mosaic coordinates
+            start_x = video_mosaic.h_offset + first_frame_shape[1] // 2
+            start_y = video_mosaic.w_offset + first_frame_shape[0]
+            start_point = (start_x, start_y)
+            continue
+
+        frame_count += 1
+        # process each frame
+        video_mosaic.process_frame(frame_cur, frame_count)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    cv2.waitKey(0)
+    cap.release()
+    cv2.destroyAllWindows()
+    cv2.imwrite('mosaic.jpg', video_mosaic.output_img)
+
+    # Detect objects on the mosaic
+    print("Detecting objects on the mosaic...")
+    detections = video_mosaic.detect_objects(video_mosaic.output_img.astype(np.uint8))
+    print(f"Detected {len(detections)} objects on the mosaic.")
+
+    # Analyze mosaic for navigation
+    print("Analyzing mosaic for navigation...")
+    navigation_map = analyze_for_navigation(video_mosaic.output_img.astype(np.uint8), detections, start_point=start_point)
+    cv2.imwrite('navigation_map.jpg', navigation_map)
+    print("Navigation map saved as 'navigation_map.jpg'")
+
 
 if __name__ == "__main__":
-    vid = None
-    if len(sys.argv) > 1:
-        vid = sys.argv[1]
-    main(vid, show_intermediate=True)
+    main()
