@@ -35,9 +35,9 @@ class VideMosaic:
         # enable visualization for intermediate results
         self.visualize = True
 
-        # Initialize YOLO model for detection
+        # Initialize YOLO model for detection with larger model for better accuracy
         try:
-            self.model = YOLO('yolov8n.pt')
+            self.model = YOLO('yolov8l.pt')  # Using large model for maximum detection quality
         except Exception as e:
             print(f"Warning: failed to load YOLO model: {e}")
             self.model = None
@@ -76,7 +76,15 @@ class VideMosaic:
     def detect_people(self, frame):
         if self.model is None:
             return []
-        results = self.model.predict(frame, classes=[0])  # class 0 is 'person'
+        # Use higher confidence threshold and optimized parameters for better quality
+        results = self.model.predict(
+            frame, 
+            classes=[0],  # class 0 is 'person'
+            conf=0.5,      # confidence threshold - only detections with 50%+ confidence
+            iou=0.45,      # IoU threshold for NMS - reduces overlapping boxes
+            imgsz=640,     # image size for detection - larger for better quality
+            verbose=False  # reduce console output
+        )
         boxes = []
         for result in results:
             for box in result.boxes:
@@ -87,14 +95,26 @@ class VideMosaic:
     def detect_objects(self, frame):
         if self.model is None:
             return []
-        results = self.model.predict(frame)
+        # Use optimized parameters for maximum detection quality
+        results = self.model.predict(
+            frame,
+            conf=0.4,      # confidence threshold - filter out low-confidence detections
+            iou=0.45,      # IoU threshold for NMS - reduces duplicate detections
+            imgsz=640,     # image size for detection - larger for better accuracy
+            verbose=False  # reduce console output
+        )
         detections = []
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 class_id = int(box.cls[0])
+                confidence = float(box.conf[0])  # Get confidence score
                 class_name = self.model.names[class_id] if hasattr(self.model, 'names') else str(class_id)
-                detections.append({'class': class_name, 'box': (int(x1), int(y1), int(x2), int(y2))})
+                detections.append({
+                    'class': class_name, 
+                    'box': (int(x1), int(y1), int(x2), int(y2)),
+                    'confidence': confidence
+                })
         return detections
 
     def match(self, des_cur, des_prev):
@@ -143,7 +163,9 @@ class VideMosaic:
         for det in detections:
             x1, y1, x2, y2 = det['box']
             cv2.rectangle(self.frame_cur, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            cv2.putText(self.frame_cur, det['class'], (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            # Display class name and confidence score
+            label = f"{det['class']} {det['confidence']:.2f}"
+            cv2.putText(self.frame_cur, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         if detections:
             os.makedirs('Detections', exist_ok=True)
             cv2.imwrite(os.path.join('Detections', f'frame_{frame_count}.jpg'), self.frame_cur)
