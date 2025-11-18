@@ -1,9 +1,7 @@
 import cv2
-from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
 import os
-import sys
 from pathfinding.core.grid import Grid
 from pathfinding.finder.a_star import AStarFinder
 from PIL import Image, ImageDraw, ImageFont
@@ -11,16 +9,18 @@ from PIL import Image, ImageDraw, ImageFont
 
 class VideMosaic:
     # def __init__(self, first_image, output_height_times=2, output_width_times=4, detector_type="sift"):
-    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift"):
+    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True):
         """This class processes every frame and generates the panorama
 
         Args:
             first_image (image for the first frame): first image to initialize the output size
-            output_height_times (int, optional): determines the output height based on input image height. Defaults to 2.
-            output_width_times (int, optional): determines the output width based on input image width. Defaults to 4.
+            output_height_times (int, optional): determines the output height based on input image height. Defaults to 3.
+            output_width_times (int, optional): determines the output width based on input image width. Defaults to 1.2.
             detector_type (str, optional): the detector for feature detection. It can be "sift" or "orb". Defaults to "sift".
+            show_intermediate (bool, optional): whether to show intermediate OpenCV windows during processing. Defaults to True.
         """
         self.detector_type = detector_type
+        self.show_intermediate = show_intermediate
         if detector_type == "sift":
             self.detector = cv2.SIFT_create(700)
             self.bf = cv2.BFMatcher()
@@ -36,6 +36,12 @@ class VideMosaic:
         except Exception as e:
             print(f"Warning: failed to load YOLO model: {e}")
             self.model = None
+
+        # Initialize OpenCV window for intermediate visualization if enabled
+        # if self.show_intermediate:
+        #     cv2.namedWindow('Mosaic Progress', cv2.WINDOW_NORMAL)
+        #     cv2.namedWindow('Current Frame', cv2.WINDOW_AUTOSIZE)
+        #     print("OpenCV windows 'Mosaic Progress' and 'Current Frame' created")
 
         self.process_first_frame(first_image)
 
@@ -190,9 +196,14 @@ class VideMosaic:
             # Display class name and confidence score
             label = f"{det['class']} {det['confidence']:.2f}"
             cv2.putText(self.frame_cur, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        if detections:
-            os.makedirs('Detections', exist_ok=True)
-            cv2.imwrite(os.path.join('Detections', f'frame_{frame_count}.jpg'), self.frame_cur)
+        # if detections:
+        #     os.makedirs('Detections', exist_ok=True)
+        #     cv2.imwrite(os.path.join('Detections', f'frame_{frame_count}.jpg'), self.frame_cur)
+
+        # Update intermediate windows if enabled
+        # if self.show_intermediate:
+        #     cv2.imshow('Mosaic Progress', self.output_img.astype(np.uint8))
+        #     cv2.imshow('Current Frame', self.frame_cur)
 
         # loop preparation
         self.H_old = self.H
@@ -441,19 +452,19 @@ def analyze_for_navigation(frame, detections, start_point=None):
             cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow for objects
 
     # --- New: detect building-like targets on the mosaic (rectangular, large contours)
-    def detect_buildings(img, min_area=50):
+    def detect_buildings(img, min_area=30):
         # Try a more robust multi-step approach to find large man-made rectangular shapes
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         # Use simple threshold for better detection
-        _, th = cv2.threshold(blur, 127, 255, cv2.THRESH_BINARY_INV)
+        _, th = cv2.threshold(blur, 125, 255, cv2.THRESH_BINARY_INV)
 
         # Morphological closing to merge roof regions and remove small holes
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         # Edge detection on closed image
-        edges = cv2.Canny(closed, 50, 150)
+        edges = cv2.Canny(closed, 30, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         buildings = []
         print(f"Found {len(contours)} contours")
@@ -622,18 +633,27 @@ def is_path_clear(x1, y1, x2, y2, obstacles):
     return True
 
 
-def main():
+def main(video_path=None, update_callback=None, show_intermediate=True):
 
-    # video_path = 'Data/rotate.mjpeg'
-    # video_path = 'Data/airplane01.mjpeg'
-    # video_path = 'Data/foglab3.mov'
-    video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
-    # video_path = "C:\\Users\\main\\Downloads\\поиски квадрокоптера 3 (360p).mp4"
+    if video_path is None:
+        video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
+    print(f"Opening video file: {video_path}")
     cap = cv2.VideoCapture(video_path)
-    is_first_frame = True
+    if not cap.isOpened():
+        print("Ошибка: Не удалось открыть видеофайл")
+        return
+
+    # Create Detections folder
+    os.makedirs('Detections', exist_ok=True)
+
+    # Get total frame count for progress calculation
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"Total frames in video: {total_frames}")
     frame_count = 0
+    is_first_frame = True
     first_frame_shape = None
-    cap.read()
+    print("Starting video processing and mosaic formation...")
+    
     while cap.isOpened():
         ret, frame_cur = cap.read()
         if not ret:
@@ -654,25 +674,92 @@ def main():
         frame_count += 1
         # process each frame
         video_mosaic.process_frame(frame_cur, frame_count)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        
+        # Update OpenCV windows
+        cv2.waitKey(1)
+        
+        # Print progress every 50 frames
+        if frame_count % 50 == 0:
+            progress = (frame_count / total_frames) * 100
+            print(f"Processed frame {frame_count}/{total_frames} ({progress:.1f}%)")
+        
+        # Check if user requested to quit during processing
+        if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
+            print("Processing interrupted by user.")
             break
-    cv2.waitKey(0)
+        
+        # Update progress if callback is provided
+        if update_callback:
+            progress = (frame_count / total_frames) * 100
+            update_callback(frame_count, video_mosaic.output_img.copy(), progress)
+            
     cap.release()
-    cv2.destroyAllWindows()
-    cv2.imwrite('mosaic.jpg', video_mosaic.output_img)
+    print("Video processing completed. Mosaic formed.")
+    
+    # Keep the final mosaic displayed until user closes it
+    if show_intermediate:
+        print("Final mosaic completed. Press any key to close the window.")
+        # cv2.imshow('Mosaic Progress', video_mosaic.output_img)
+        # cv2.waitKey(0)  # Wait for any key press
+        cv2.destroyAllWindows()
+    else:
+        cv2.destroyAllWindows()
+        
+    print("Cropping black areas from mosaic...")
+    try:
+        cropped = crop_black_areas(video_mosaic.output_img)
+        print(f"Cropped mosaic size: {cropped.shape[1]}x{cropped.shape[0]}")
+    except Exception as e:
+        print(f"Warning: crop failed, using full mosaic: {e}")
+        cropped = video_mosaic.output_img
+
+    print("Scaling mosaic to screen (preserving aspect)...")
+    try:
+        scaled_mosaic = scale_to_screen(cropped)
+        print(f"Scaled mosaic size: {scaled_mosaic.shape[1]}x{scaled_mosaic.shape[0]}")
+    except Exception as e:
+        print(f"Warning: scaling failed, saving original: {e}")
+        scaled_mosaic = cropped
+
+    print("Saving mosaic image...")
+    cv2.imwrite('mosaic.jpg', scaled_mosaic)
+    print("Mosaic saved as 'mosaic.jpg'")
 
     # Detect objects on the mosaic
     print("Detecting objects on the mosaic...")
     detections = video_mosaic.detect_objects(video_mosaic.output_img.astype(np.uint8))
     print(f"Detected {len(detections)} objects on the mosaic.")
 
-    # Analyze mosaic for navigation
+    # Optionally analyze mosaic for navigation: mark obstacles and draw paths to objects
+    # Commenting out the navigation map creation as per user request
     print("Analyzing mosaic for navigation...")
-    navigation_map = analyze_for_navigation(video_mosaic.output_img.astype(np.uint8), detections, start_point=start_point)
-    print("Cropping black areas from navigation map...")
-    navigation_map = crop_black_areas(navigation_map)
-    cv2.imwrite('navigation_map.jpg', navigation_map)
+    navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), detections, start_point=start_point)
+    print("Scaling navigation map to screen...")
+    try:
+        scaled_nav = scale_to_screen(navigation_map)
+    except Exception:
+        scaled_nav = navigation_map
+    print("Saving navigation map...")
+    cv2.imwrite('navigation_map.jpg', scaled_nav)
     print("Navigation map saved as 'navigation_map.jpg'")
+    if show_intermediate:
+        cv2.imshow('Navigation Map', scaled_nav)
+        cv2.waitKey(1)
+    if show_intermediate:
+        cv2.imshow('Navigation Map', navigation_map)
+        print("Navigation map displayed. Press any key in the window to continue.")
+    
+    # Close all OpenCV windows at the end of the program
+    cv2.destroyAllWindows()
+    
+    # Check if processing was interrupted by user
+    if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
+        print("Video mosaic generation was interrupted by user.")
+        return
+    
+    # Final update with completion
+    if update_callback:
+        update_callback(frame_count, video_mosaic.output_img.copy(), 100)
 
 
 if __name__ == "__main__":

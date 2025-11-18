@@ -5,7 +5,9 @@ from PIL import Image, ImageTk
 import os
 import threading
 import cv2
-import main  # Import the main script
+from main import main
+import queue
+import numpy as np
 
 ctk.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("green")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -21,6 +23,7 @@ class App(ctk.CTk):
         self.video_path = None
         self.mosaic_image = None
         self.nav_image = None
+        self.queue = queue.Queue()
 
         # UI Elements
         self.select_button = ctk.CTkButton(self, text="Выбрать видео", command=self.select_video)
@@ -71,6 +74,18 @@ class App(ctk.CTk):
         self.detections_list = ctk.CTkScrollableFrame(self.detections_frame)
         self.detections_list.pack(fill="both", expand=True)
 
+        # Start processing the queue
+        self.process_queue()
+
+    def process_queue(self):
+        try:
+            while True:
+                frame_count, current_mosaic, progress = self.queue.get_nowait()
+                self._update_progress_ui(frame_count, current_mosaic, progress)
+        except queue.Empty:
+            pass
+        self.after(100, self.process_queue)
+
     def select_video(self):
         self.video_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi *.mov")])
         if self.video_path:
@@ -91,7 +106,7 @@ class App(ctk.CTk):
         # Since main is hardcoded, perhaps modify main to accept argument
 
         # For now, assume we run main.main() and then load results
-        main.main(self.video_path, update_callback=self.update_progress)  # Pass the callback
+        main(self.video_path, update_callback=self.update_progress, show_intermediate=False)  # Pass the callback
 
         # Load results
         self.load_results()
@@ -122,10 +137,12 @@ class App(ctk.CTk):
                     btn.pack(pady=5)
                     
     def update_progress(self, frame_count, current_mosaic, progress):
-        # Update progress bar in the main thread
-        self.after(0, self._update_progress_ui, frame_count, current_mosaic, progress)
+        # Put the update in the queue to be processed in the main thread
+        self.queue.put((frame_count, current_mosaic, progress))
         
     def _update_progress_ui(self, frame_count, current_mosaic, progress):
+        # Ensure current_mosaic is uint8
+        current_mosaic = current_mosaic.astype(np.uint8)
         # Update the progress bar and label
         self.progress_bar.set(progress / 100)
         self.progress_label.configure(text=f"Прогресс: {progress:.1f}% (Кадр {frame_count})")
