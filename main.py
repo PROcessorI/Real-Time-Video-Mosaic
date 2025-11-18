@@ -87,9 +87,12 @@ class VideMosaic:
     def detect_objects(self, frame):
         if self.model is None:
             return []
+        # Resize frame to standard size for better detection
+        original_shape = frame.shape[:2]
+        resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
         # Use optimized parameters for maximum detection quality
         results = self.model.predict(
-            frame,
+            resized,
             conf=0.4,      # confidence threshold - filter out low-confidence detections
             iou=0.45,      # IoU threshold for NMS - reduces duplicate detections
             imgsz=640,     # image size for detection - larger for better accuracy
@@ -99,6 +102,13 @@ class VideMosaic:
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                # Scale back to original size
+                scale_x = original_shape[1] / 640
+                scale_y = original_shape[0] / 640
+                x1 *= scale_x
+                x2 *= scale_x
+                y1 *= scale_y
+                y2 *= scale_y
                 class_id = int(box.cls[0])
                 confidence = float(box.conf[0])  # Get confidence score
                 class_name = self.model.names[class_id] if hasattr(self.model, 'names') else str(class_id)
@@ -431,22 +441,19 @@ def analyze_for_navigation(frame, detections, start_point=None):
             cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow for objects
 
     # --- New: detect building-like targets on the mosaic (rectangular, large contours)
-    def detect_buildings(img, min_area=100):
+    def detect_buildings(img, min_area=50):
         # Try a more robust multi-step approach to find large man-made rectangular shapes
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Adaptive threshold to separate objects with different lighting
-        try:
-            th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
-        except Exception:
-            _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Use simple threshold for better detection
+        _, th = cv2.threshold(blur, 127, 255, cv2.THRESH_BINARY_INV)
 
         # Morphological closing to merge roof regions and remove small holes
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         # Edge detection on closed image
-        edges = cv2.Canny(closed, 30, 120)
+        edges = cv2.Canny(closed, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         buildings = []
         print(f"Found {len(contours)} contours")
@@ -455,14 +462,14 @@ def analyze_for_navigation(frame, detections, start_point=None):
             if area < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)  # More lenient approximation
             x, y, w, h = cv2.boundingRect(approx)
             rect_area = w * h
             if rect_area <= 0:
                 continue
             fill_ratio = area / float(rect_area)
-            # Accept roughly rectangular-ish large contours OR tall/wide boxes
-            if fill_ratio > 0.1 and w > 10 and h > 10 and len(approx) >= 4 and len(approx) <= 8:
+            # Relaxed criteria for buildings
+            if fill_ratio > 0.05 and w > 5 and h > 5 and len(approx) >= 3:  # At least triangle
                 buildings.append((x, y, x + w, y + h))
         print(f"Detected {len(buildings)} buildings")
         return buildings
@@ -523,8 +530,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
         try:
             print("Computing paths...")
             buildings = detect_buildings(frame)
-            # Limit to first 5 buildings for faster processing
-            buildings = buildings[:5]
+            # Removed limit to process all detected buildings
             result_dict['buildings'] = buildings
             overlays = []
             labels = []
@@ -663,6 +669,8 @@ def main():
     # Analyze mosaic for navigation
     print("Analyzing mosaic for navigation...")
     navigation_map = analyze_for_navigation(video_mosaic.output_img.astype(np.uint8), detections, start_point=start_point)
+    print("Cropping black areas from navigation map...")
+    navigation_map = crop_black_areas(navigation_map)
     cv2.imwrite('navigation_map.jpg', navigation_map)
     print("Navigation map saved as 'navigation_map.jpg'")
 
