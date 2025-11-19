@@ -1,2 +1,34 @@
+# Virtual environments
 venv
+test_venv
+env
+.env
+
+# Python cache
 __pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Output files
+mosaic.jpg
+navigation_map.jpg
+Detections/
+
+# Model files (optional - uncomment if models should not be tracked)
+# *.pt
+
+# Logs
+*.log
