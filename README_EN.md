@@ -56,6 +56,13 @@ source venv/bin/activate
 
 ### 3. Install dependencies
 
+#### For Linux/Ubuntu (additional installation required):
+```bash
+sudo apt-get update
+sudo apt-get install python3-tk
+```
+
+#### Install Python packages:
 ```bash
 pip install -r requirements.txt
 ```
