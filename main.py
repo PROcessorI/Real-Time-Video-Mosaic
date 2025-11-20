@@ -5,11 +5,13 @@ import os
 from pathfinding.core.grid import Grid
 from pathfinding.finder.a_star import AStarFinder
 from PIL import Image, ImageDraw, ImageFont
+import argparse
+import sys
 
 
 class VideMosaic:
     # def __init__(self, first_image, output_height_times=2, output_width_times=4, detector_type="sift"):
-    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True):
+    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True, output_dir=None):
         """This class processes every frame and generates the panorama
 
         Args:
@@ -18,9 +20,11 @@ class VideMosaic:
             output_width_times (int, optional): determines the output width based on input image width. Defaults to 1.2.
             detector_type (str, optional): the detector for feature detection. It can be "sift" or "orb". Defaults to "sift".
             show_intermediate (bool, optional): whether to show intermediate OpenCV windows during processing. Defaults to True.
+            output_dir (str, optional): directory to save output files. Defaults to None.
         """
         self.detector_type = detector_type
         self.show_intermediate = show_intermediate
+        self.output_dir = output_dir
         if detector_type == "sift":
             self.detector = cv2.SIFT_create(700)
             self.bf = cv2.BFMatcher()
@@ -32,7 +36,7 @@ class VideMosaic:
 
         # Initialize YOLO model for detection with larger model for better accuracy
         try:
-            self.model = YOLO('yolov8n.pt')  # Using large model for maximum detection quality
+            self.model = YOLO('yolo11n.pt')  # YOLOv11 nano model
         except Exception as e:
             print(f"Warning: failed to load YOLO model: {e}")
             self.model = None
@@ -196,9 +200,10 @@ class VideMosaic:
             # Display class name and confidence score
             label = f"{det['class']} {det['confidence']:.2f}"
             cv2.putText(self.frame_cur, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        # if detections:
-        #     os.makedirs('Detections', exist_ok=True)
-        #     cv2.imwrite(os.path.join('Detections', f'frame_{frame_count}.jpg'), self.frame_cur)
+        if detections:
+            detections_dir = os.path.join(self.output_dir, 'Detections') if self.output_dir else 'Detections'
+            os.makedirs(detections_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(detections_dir, f'frame_{frame_count}.jpg'), self.frame_cur)
 
         # Update intermediate windows if enabled
         # if self.show_intermediate:
@@ -633,7 +638,7 @@ def is_path_clear(x1, y1, x2, y2, obstacles):
     return True
 
 
-def main(video_path=None, update_callback=None, show_intermediate=True):
+def main(video_path=None, update_callback=None, show_intermediate=True, output_dir=None):
 
     if video_path is None:
         video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
@@ -644,7 +649,8 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
         return
 
     # Create Detections folder
-    os.makedirs('Detections', exist_ok=True)
+    detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
+    os.makedirs(detections_dir, exist_ok=True)
 
     # Get total frame count for progress calculation
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -663,7 +669,7 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
 
         if is_first_frame:
             first_frame_shape = frame_cur.shape[:2]
-            video_mosaic = VideMosaic(frame_cur, detector_type="sift")
+            video_mosaic = VideMosaic(frame_cur, detector_type="sift", show_intermediate=show_intermediate, output_dir=output_dir)
             is_first_frame = False
             # Calculate start point as bottom center of first frame in mosaic coordinates
             start_x = video_mosaic.h_offset + first_frame_shape[1] // 2
@@ -682,6 +688,7 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
         if frame_count % 50 == 0:
             progress = (frame_count / total_frames) * 100
             print(f"Processed frame {frame_count}/{total_frames} ({progress:.1f}%)")
+            sys.stdout.flush()
         
         # Check if user requested to quit during processing
         if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
@@ -695,6 +702,7 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
             
     cap.release()
     print("Video processing completed. Mosaic formed.")
+    sys.stdout.flush()
     
     # Keep the final mosaic displayed until user closes it
     if show_intermediate:
@@ -722,8 +730,9 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
         scaled_mosaic = cropped
 
     print("Saving mosaic image...")
-    cv2.imwrite('mosaic.jpg', scaled_mosaic)
-    print("Mosaic saved as 'mosaic.jpg'")
+    mosaic_path = os.path.join(output_dir, 'mosaic.jpg') if output_dir else 'mosaic.jpg'
+    cv2.imwrite(mosaic_path, scaled_mosaic)
+    print(f"Mosaic saved as '{mosaic_path}'")
 
     # Detect objects on the mosaic
     print("Detecting objects on the mosaic...")
@@ -740,8 +749,10 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
     except Exception:
         scaled_nav = navigation_map
     print("Saving navigation map...")
-    cv2.imwrite('navigation_map.jpg', scaled_nav)
-    print("Navigation map saved as 'navigation_map.jpg'")
+    nav_path = os.path.join(output_dir, 'navigation_map.jpg') if output_dir else 'navigation_map.jpg'
+    cv2.imwrite(nav_path, scaled_nav)
+    print(f"Navigation map saved as '{nav_path}'")
+    sys.stdout.flush()
     if show_intermediate:
         cv2.imshow('Navigation Map', scaled_nav)
         cv2.waitKey(1)
@@ -763,4 +774,12 @@ def main(video_path=None, update_callback=None, show_intermediate=True):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Video Mosaic Processor')
+    parser.add_argument('video_path', nargs='?', default=None, help='Path to the video file')
+    parser.add_argument('--output-dir', default=None, help='Output directory for results')
+    parser.add_argument('--no-gui', action='store_true', help='Disable GUI windows')
+    
+    args = parser.parse_args()
+    
+    show_intermediate = not args.no_gui
+    main(video_path=args.video_path, show_intermediate=show_intermediate, output_dir=args.output_dir)

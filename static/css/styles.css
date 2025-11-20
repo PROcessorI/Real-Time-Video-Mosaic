@@ -1,0 +1,105 @@
+/* Light theme */
+.light-theme {
+    --bg-color: #ffffff;
+    --text-color: #333333;
+    --card-bg: #f8f9fa;
+    --border-color: #dee2e6;
+    --primary-color: #007bff;
+    --success-color: #28a745;
+    --muted-color: #6c757d;
+}
+
+.light-theme html {
+    background-color: var(--bg-color) !important;
+}
+
+.light-theme body {
+    background-color: var(--bg-color) !important;
+    color: var(--text-color);
+}
+
+.light-theme .card {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+    color: var(--text-color);
+}
+
+.light-theme .navbar {
+    background-color: var(--primary-color) !important;
+}
+
+/* Dark theme */
+.dark-theme {
+    --bg-color: #121212;
+    --text-color: #ffffff;
+    --card-bg: #2a2a2a;
+    --border-color: #404040;
+    --primary-color: #bb86fc;
+    --success-color: #03dac6;
+    --muted-color: #cccccc;
+}
+
+.dark-theme html {
+    background-color: var(--bg-color) !important;
+}
+
+.dark-theme body {
+    background-color: var(--bg-color) !important;
+    color: var(--text-color);
+}
+
+.dark-theme .card {
+    background-color: var(--card-bg);
+    border-color: var(--border-color);
+    color: var(--text-color);
+}
+
+.dark-theme .navbar {
+    background-color: #333333 !important;
+}
+
+.dark-theme .btn-outline-light {
+    color: var(--text-color);
+    border-color: var(--text-color);
+}
+
+.dark-theme .btn-outline-light:hover {
+    background-color: var(--text-color);
+    color: var(--bg-color);
+}
+
+.dark-theme .text-muted {
+    color: var(--muted-color) !important;
+}
+
+/* Common styles */
+html {
+    height: 100%;
+    transition: background-color 0.3s;
+}
+
+body {
+    min-height: 100vh;
+    transition: background-color 0.3s, color 0.3s;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+}
+
+.card {
+    transition: background-color 0.3s, border-color 0.3s;
+}
+
+.progress-bar {
+    transition: width 0.3s;
+}
+
+.result-image {
+    max-width: 100%;
+    height: auto;
+    border-radius: 5px;
+    margin-bottom: 10px;
+}
+
+.card-title {
+    font-weight: bold;
+}

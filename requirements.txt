@@ -4,3 +4,4 @@ ultralytics
 pathfinding
 Pillow
 customtkinter
+flask
