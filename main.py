@@ -11,16 +11,17 @@ import sys
 
 class VideMosaic:
     # def __init__(self, first_image, output_height_times=2, output_width_times=4, detector_type="sift"):
-    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True, output_dir=None):
-        """This class processes every frame and generates the panorama
+    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True, output_dir=None, visualize=True):
+        """Этот класс обрабатывает каждый кадр и генерирует панораму.
 
         Args:
-            first_image (image for the first frame): first image to initialize the output size
-            output_height_times (int, optional): determines the output height based on input image height. Defaults to 3.
-            output_width_times (int, optional): determines the output width based on input image width. Defaults to 1.2.
-            detector_type (str, optional): the detector for feature detection. It can be "sift" or "orb". Defaults to "sift".
-            show_intermediate (bool, optional): whether to show intermediate OpenCV windows during processing. Defaults to True.
-            output_dir (str, optional): directory to save output files. Defaults to None.
+            first_image (изображение для первого кадра): первое изображение для инициализации размера вывода
+            output_height_times (int, optional): определяет высоту вывода на основе высоты входного изображения. По умолчанию 3.
+            output_width_times (int, optional): определяет ширину вывода на основе ширины входного изображения. По умолчанию 1.2.
+            detector_type (str, optional): детектор для обнаружения особенностей. Может быть "sift" или "orb". По умолчанию "sift".
+            show_intermediate (bool, optional): показывать ли промежуточные окна OpenCV во время обработки. По умолчанию True.
+            output_dir (str, optional): каталог для сохранения выходных файлов. По умолчанию None.
+            visualize (bool, optional): показывать ли визуализацию сопоставления ключевых точек. По умолчанию True.
         """
         self.detector_type = detector_type
         self.show_intermediate = show_intermediate
@@ -32,27 +33,27 @@ class VideMosaic:
             self.detector = cv2.ORB_create(700)
             self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        self.visualize = True
+        self.visualize = visualize
 
-        # Initialize YOLO model for detection with larger model for better accuracy
+        # Инициализировать модель YOLO для обнаружения с большей моделью для лучшей точности
         try:
-            self.model = YOLO('yolo11n.pt')  # YOLOv11 nano model
+            self.model = YOLO('yolo11n.pt')  # YOLOv11 nano модель
         except Exception as e:
-            print(f"Warning: failed to load YOLO model: {e}")
+            print(f"Предупреждение: не удалось загрузить модель YOLO: {e}")
             self.model = None
 
-        # Initialize OpenCV window for intermediate visualization if enabled
+        # Инициализировать окно OpenCV для промежуточной визуализации, если включено
         # if self.show_intermediate:
         #     cv2.namedWindow('Mosaic Progress', cv2.WINDOW_NORMAL)
         #     cv2.namedWindow('Current Frame', cv2.WINDOW_AUTOSIZE)
-        #     print("OpenCV windows 'Mosaic Progress' and 'Current Frame' created")
+        #     print("Окна OpenCV 'Mosaic Progress' и 'Current Frame' созданы")
 
         self.process_first_frame(first_image)
 
         self.output_img = np.zeros(shape=(int(output_height_times * first_image.shape[0]), int(
             output_width_times*first_image.shape[1]), first_image.shape[2]))
 
-        # offset
+        # смещение
         # self.w_offset = int(self.output_img.shape[0]/2 - first_image.shape[0]/2)
         # self.h_offset = int(self.output_img.shape[1]/2 - first_image.shape[1]/2)
         self.w_offset = int(self.output_img.shape[0]/1 - first_image.shape[0]/1)
@@ -66,10 +67,10 @@ class VideMosaic:
         self.H_old[1, 2] = self.w_offset
 
     def process_first_frame(self, first_image):
-        """processes the first frame for feature detection and description
+        """обрабатывает первый кадр для обнаружения особенностей и описания
 
         Args:
-            first_image (cv2 image/np array): first image for feature detection
+            first_image (cv2 изображение/np массив): первое изображение для обнаружения особенностей
         """
         self.frame_prev = first_image
         frame_gray_prev = cv2.cvtColor(first_image, cv2.COLOR_BGR2GRAY)
@@ -78,14 +79,14 @@ class VideMosaic:
     def detect_people(self, frame):
         if self.model is None:
             return []
-        # Use higher confidence threshold and optimized parameters for better quality
+        # Использовать более высокий порог уверенности и оптимизированные параметры для лучшего качества
         results = self.model.predict(
             frame, 
-            classes=[0],  # class 0 is 'person'
-            conf=0.5,      # confidence threshold - only detections with 50%+ confidence
-            iou=0.45,      # IoU threshold for NMS - reduces overlapping boxes
-            imgsz=640,     # image size for detection - larger for better quality
-            verbose=False  # reduce console output
+            classes=[0],  # класс 0 - 'person'
+            conf=0.5,      # порог уверенности - только обнаружения с 50%+ уверенностью
+            iou=0.45,      # порог IoU для NMS - уменьшает перекрывающиеся боксы
+            imgsz=640,     # размер изображения для обнаружения - больше для лучшего качества
+            verbose=False  # уменьшить вывод в консоль
         )
         boxes = []
         for result in results:
@@ -97,22 +98,22 @@ class VideMosaic:
     def detect_objects(self, frame):
         if self.model is None:
             return []
-        # Resize frame to standard size for better detection
+        # Изменить размер кадра до стандартного размера для лучшего обнаружения
         original_shape = frame.shape[:2]
         resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
-        # Use optimized parameters for maximum detection quality
+        # Использовать оптимизированные параметры для максимального качества обнаружения
         results = self.model.predict(
             resized,
-            conf=0.4,      # confidence threshold - filter out low-confidence detections
-            iou=0.45,      # IoU threshold for NMS - reduces duplicate detections
-            imgsz=640,     # image size for detection - larger for better accuracy
-            verbose=False  # reduce console output
+            conf=0.4,      # порог уверенности - фильтровать низкоуверенные обнаружения
+            iou=0.45,      # порог IoU для NMS - уменьшает дублирующиеся обнаружения
+            imgsz=640,     # размер изображения для обнаружения - больше для лучшей точности
+            verbose=False  # уменьшить вывод в консоль
         )
         detections = []
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Scale back to original size
+                # Масштабировать обратно к оригинальному размеру
                 scale_x = original_shape[1] / 640
                 scale_y = original_shape[0] / 640
                 x1 *= scale_x
@@ -120,7 +121,7 @@ class VideMosaic:
                 y1 *= scale_y
                 y2 *= scale_y
                 class_id = int(box.cls[0])
-                confidence = float(box.conf[0])  # Get confidence score
+                confidence = float(box.conf[0])  # Получить оценку уверенности
                 class_name = self.model.names[class_id] if hasattr(self.model, 'names') else str(class_id)
                 detections.append({
                     'class': class_name, 
@@ -130,16 +131,16 @@ class VideMosaic:
         return detections
 
     def match(self, des_cur, des_prev):
-        """matches the descriptors
+        """сопоставляет дескрипторы
 
         Args:
-            des_cur (np array): current frame descriptor
-            des_prev (np arrau): previous frame descriptor
+            des_cur (np массив): дескрипторы текущего кадра
+            des_prev (np массив): дескрипторы предыдущего кадра
 
         Returns:
-            array: and array of matches between descriptors
+            массив: массив соответствий между дескрипторами
         """
-        # matching
+        # сопоставление
         if self.detector_type == "sift":
             pair_matches = self.bf.knnMatch(des_cur, des_prev, k=2)
             matches = []
@@ -150,12 +151,12 @@ class VideMosaic:
         elif self.detector_type == "orb":
             matches = self.bf.match(des_cur, des_prev)
 
-        # Sort them in the order of their distance.
+        # Сортировать их в порядке их расстояния.
         matches = sorted(matches, key=lambda x: x.distance)
 
-        # get the maximum of 20  best matches
-        matches = matches[:min(len(matches), 20)]
-        # Draw first 10 matches.
+        # получить максимум 20 лучших соответствий
+        # matches = matches[:min(len(matches), 20)]
+        # Нарисовать первые 10 соответствий.
         if self.visualize:
             match_img = cv2.drawMatches(self.frame_cur, self.kp_cur, self.frame_prev, self.kp_prev, matches, None,
                                         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
@@ -164,10 +165,10 @@ class VideMosaic:
         return matches
 
     def process_frame(self, frame_cur, frame_count):
-        """gets an image and processes that image for mosaicing
+        """получает изображение и обрабатывает его для мозаики
 
         Args:
-            frame_cur (np array): input of current frame for the mosaicing
+            frame_cur (np массив): вход текущего кадра для мозаики
         """
         self.frame_cur = frame_cur
         frame_gray_cur = cv2.cvtColor(frame_cur, cv2.COLOR_BGR2GRAY)
@@ -180,7 +181,7 @@ class VideMosaic:
 
         self.H = self.findHomography(self.kp_cur, self.kp_prev, self.matches)
         self.H = np.matmul(self.H_old, self.H)
-        # TODO: check for bad Homography
+        # TODO: проверить на плохую гомографию
 
         self.warp(self.frame_cur, self.H)
 
@@ -197,7 +198,7 @@ class VideMosaic:
         for det in detections:
             x1, y1, x2, y2 = det['box']
             cv2.rectangle(self.frame_cur, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            # Display class name and confidence score
+            # Отобразить имя класса и оценку уверенности
             label = f"{det['class']} {det['confidence']:.2f}"
             cv2.putText(self.frame_cur, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         if detections:
@@ -205,12 +206,12 @@ class VideMosaic:
             os.makedirs(detections_dir, exist_ok=True)
             cv2.imwrite(os.path.join(detections_dir, f'frame_{frame_count}.jpg'), self.frame_cur)
 
-        # Update intermediate windows if enabled
+        # Обновить промежуточные окна, если включено
         # if self.show_intermediate:
         #     cv2.imshow('Mosaic Progress', self.output_img.astype(np.uint8))
         #     cv2.imshow('Current Frame', self.frame_cur)
 
-        # loop preparation
+        # подготовка цикла
         self.H_old = self.H
         self.kp_prev = self.kp_cur
         self.des_prev = self.des_cur
@@ -218,17 +219,17 @@ class VideMosaic:
 
     @ staticmethod
     def findHomography(image_1_kp, image_2_kp, matches):
-        """gets two matches and calculate the homography between two images
+        """получает два соответствия и рассчитывает гомографию между двумя изображениями
 
         Args:
-            image_1_kp (np array): keypoints of image 1
-            image_2_kp (np_array): keypoints of image 2
-            matches (np array): matches between keypoints in image 1 and image 2
+            image_1_kp (np массив): ключевые точки изображения 1
+            image_2_kp (np массив): ключевые точки изображения 2
+            matches (np массив): соответствия между ключевыми точками в изображении 1 и 2
 
         Returns:
-            np arrat of shape [3,3]: Homography matrix
+            np массив формы [3,3]: матрица гомографии
         """
-        # taken from https://github.com/cmcguinness/focusstack/blob/master/FocusStack.py
+        # взято из https://github.com/cmcguinness/focusstack/blob/master/FocusStack.py
 
         image_1_points = np.zeros((len(matches), 1, 2), dtype=np.float32)
         image_2_points = np.zeros((len(matches), 1, 2), dtype=np.float32)
@@ -242,14 +243,14 @@ class VideMosaic:
         return homography
 
     def warp(self, frame_cur, H):
-        """ warps the current frame based of calculated homography H
+        """деформирует текущий кадр на основе рассчитанной гомографии H
 
         Args:
-            frame_cur (np array): current frame
-            H (np array of shape [3,3]): homography matrix
+            frame_cur (np массив): текущий кадр
+            H (np массив формы [3,3]): матрица гомографии
 
         Returns:
-            np array: image output of mosaicing
+            np массив: выходное изображение мозаики
         """
         warped_img = cv2.warpPerspective(frame_cur, H, (self.output_img.shape[1], self.output_img.shape[0]), flags=cv2.INTER_LINEAR)
 
@@ -260,21 +261,22 @@ class VideMosaic:
         output_temp = np.copy(self.output_img)
         output_temp = self.draw_border(output_temp, transformed_corners, color=(0, 0, 255))
         
-        cv2.namedWindow('output', cv2.WINDOW_NORMAL)
-        cv2.imshow('output',  output_temp/255.)
+        if self.visualize:
+            cv2.namedWindow('output', cv2.WINDOW_NORMAL)
+            cv2.imshow('output',  output_temp/255.)
 
         return self.output_img
 
     @ staticmethod
     def get_transformed_corners(frame_cur, H):
-        """finds the corner of the current frame after warp
+        """находит угол текущего кадра после деформации
 
         Args:
-            frame_cur (np array): current frame
-            H (np array of shape [3,3]): Homography matrix 
+            frame_cur (np массив): текущий кадр
+            H (np массив формы [3,3]): матрица гомографии
 
         Returns:
-            [np array]: a list of 4 corner points after warping
+            [np массив]: список из 4 угловых точек после деформации
         """
         corner_0 = np.array([0, 0])
         corner_1 = np.array([frame_cur.shape[1], 0])
@@ -292,15 +294,15 @@ class VideMosaic:
         return transformed_corners
 
     def draw_border(self, image, corners, color=(0, 0, 0)):
-        """This functions draw rectancle border
+        """Эта функция рисует прямоугольную границу
 
         Args:
-            image ([type]): current mosaiced output
-            corners (np array): list of corner points
-            color (tuple, optional): color of the border lines. Defaults to (0, 0, 0).
+            image ([type]): текущий выход мозаики
+            corners (np массив): список угловых точек
+            color (tuple, optional): цвет линий границы. По умолчанию (0, 0, 0).
 
         Returns:
-            np array: the output image with border
+            np массив: выходное изображение с границей
         """
         for i in range(corners.shape[1]-1, -1, -1):
             cv2.line(image, tuple(corners[0, i, :]), tuple(corners[0, i-1, :]), thickness=5, color=color)
@@ -317,12 +319,12 @@ def crop_black_areas(image):
 
 
 def scale_to_screen(image, target_w=None, target_h=None):
-    """Scale image to target size (defaults to primary screen size on Windows) while preserving aspect ratio.
+    """Масштабировать изображение до целевого размера (по умолчанию размер первичного экрана на Windows) с сохранением соотношения сторон.
 
-    Returns the scaled image (may be larger than original).
+    Возвращает масштабированное изображение (может быть больше оригинала).
     """
     ih, iw = image.shape[0], image.shape[1]
-    # Try to get Windows primary screen size
+    # Попытаться получить размер первичного экрана Windows
     screen_w = target_w
     screen_h = target_h
     if screen_w is None or screen_h is None:
@@ -332,13 +334,13 @@ def scale_to_screen(image, target_w=None, target_h=None):
             screen_w = user32.GetSystemMetrics(0)
             screen_h = user32.GetSystemMetrics(1)
         except Exception:
-            # fallback
+            # резерв
             screen_w, screen_h = 1920, 1080
 
-    # Compute scale keeping aspect
+    # Вычислить масштаб, сохраняя соотношение
     scale = min(max(1.0, screen_w / float(iw)), max(1.0, screen_h / float(ih)))
-    # Use the minimal upscaling factor that fits either width or height
-    # but keep aspect ratio: choose scale such that image fits screen in at least one dimension
+    # Использовать минимальный коэффициент увеличения, который помещает изображение на экран в хотя бы одном измерении
+    # но сохранить соотношение сторон: выбрать масштаб, такой что изображение помещается на экран в хотя бы одном измерении
     scale_w = screen_w / float(iw)
     scale_h = screen_h / float(ih)
     scale = min(scale_w, scale_h)
@@ -362,20 +364,20 @@ def draw_dotted_line(img, pt1, pt2, color, thickness):
 
 
 def analyze_for_navigation(frame, detections, start_point=None):
-    """Simple analysis for navigation: mark obstacles and draw paths to objects on a single frame.
+    """Простой анализ для навигации: отметить препятствия и нарисовать пути к объектам на одном кадре.
 
     Args:
-        frame (np array): the last frame
-        detections (list): list of detected objects
+        frame (np массив): последний кадр
+        detections (list): список обнаруженных объектов
 
     Returns:
-        np array: frame with marked obstacles and paths
+        np массив: кадр с отмеченными препятствиями и путями
     """
     labels_to_draw = []
-    # Convert to HSV for better color detection
+    # Преобразовать в HSV для лучшего обнаружения цвета
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Define color ranges for obstacles (simplified)
+    # Определить диапазоны цветов для препятствий (упрощено)
     lower_green = np.array([35, 50, 50])
     upper_green = np.array([80, 255, 255])
     mask_green = cv2.inRange(hsv, lower_green, upper_green)
@@ -386,22 +388,22 @@ def analyze_for_navigation(frame, detections, start_point=None):
 
     obstacles = cv2.bitwise_or(mask_green, mask_blue)
 
-    # Mark obstacles as contours on frame copy
+    # Отметить препятствия как контуры на копии кадра
     nav_map = frame.copy()
     contours, _ = cv2.findContours(obstacles, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(nav_map, contours, -1, (0, 0, 255), 2)  # Red contours for obstacles
+    cv2.drawContours(nav_map, contours, -1, (0, 0, 255), 2)  # Красные контуры для препятствий
 
-    # default center point (bottom-center) unless provided by GUI
+    # точка по умолчанию (нижний-центр) если не предоставлена GUI
     default_start = (frame.shape[1] // 2, frame.shape[0] - 50)
     if start_point is not None:
         start_x, start_y = start_point
     else:
         start_x, start_y = default_start
 
-    # Mark start position
-    cv2.circle(nav_map, (start_x, start_y), 10, (255, 255, 255), -1)  # White circle for start
+    # Отметить начальную позицию
+    cv2.circle(nav_map, (start_x, start_y), 10, (255, 255, 255), -1)  # Белый круг для старта
 
-    # Use PIL to add text with Russian support
+    # Использовать PIL для добавления текста с поддержкой русского
     pil_img = Image.fromarray(cv2.cvtColor(nav_map, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil_img)
     # Попытка загрузить TTF-шрифт с поддержкой кириллицы (Windows). Если не найден - fallback на встроенный.
@@ -424,75 +426,75 @@ def analyze_for_navigation(frame, detections, start_point=None):
             continue
 
     if font is None:
-        # last resort: default font (ограниченная кириллица возможна / может показывать '?')
+        # последний резерв: шрифт по умолчанию (ограниченная кириллица возможна / может показывать '?')
         try:
             font = ImageFont.load_default()
-            print("Warning: TTF font not found; using default font which may not support Cyrillic fully.")
+            print("Предупреждение: TTF шрифт не найден; используется шрифт по умолчанию, который может не поддерживать кириллицу полностью.")
         except Exception:
             font = None
 
-    # If font is still None, PIL will use a fallback when drawing, but log for the user.
+    # Если шрифт все еще None, PIL будет использовать fallback при рисовании, но логировать для пользователя.
     if font is None:
-        print("Warning: No font available for drawing text. Русский текст может не отображаться.")
+        print("Предупреждение: Шрифт недоступен для рисования текста. Русский текст может не отображаться.")
 
-    # Draw legend and start label (PIL handles Unicode if font supports it)
+    # Нарисовать легенду и метку старта (PIL обрабатывает Unicode если шрифт поддерживает)
     try:
         draw.text((10, 30), "Красные контуры: препятствия", fill=(255, 0, 0), font=font)
         draw.text((10, 60), "Зелёные линии: пути к объектам", fill=(0, 255, 0), font=font)
         draw.text((10, 90), "Жёлтые прямоугольники: обнаруженные объекты", fill=(255, 255, 0), font=font)
     except Exception as e:
-        # As a graceful fallback, try OpenCV text (may show '?') and print the error
-        print(f"Error drawing with PIL font: {e}")
+        # Как изящный fallback, попробовать текст OpenCV (может показывать '?') и напечатать ошибку
+        print(f"Ошибка рисования с шрифтом PIL: {e}")
         cv2.putText(nav_map, "Старт", (start_x + 15, start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         cv2.putText(nav_map, "Красные контуры: препятствия", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         cv2.putText(nav_map, "Зелёные линии: пути к объектам", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(nav_map, "Жёлтые прямоугольники: обнаруженные объекты", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     nav_map = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-    # Mark objects on the map without drawing routes
+    # Отметить объекты на карте без рисования маршрутов
     for det in detections:
-        if det['class'] in ['person', 'car', 'truck', 'dog', 'horse', 'cat']:  # Key objects
+        if det['class'] in ['person', 'car', 'truck', 'dog', 'horse', 'cat']:  # Ключевые объекты
             x1, y1, x2, y2 = det['box']
-            # Mark object
-            cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow for objects
+            # Отметить объект
+            cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Желтый для объектов
 
-    # --- New: detect building-like targets on the mosaic (rectangular, large contours)
+    # --- Новое: обнаружить цели типа зданий на мозаике (прямоугольные, большие контуры)
     def detect_buildings(img, min_area=30):
-        # Try a more robust multi-step approach to find large man-made rectangular shapes
+        # Попытаться более надежный многошаговый подход для поиска больших искусственных прямоугольных форм
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Use simple threshold for better detection
+        # Использовать простой порог для лучшего обнаружения
         _, th = cv2.threshold(blur, 125, 255, cv2.THRESH_BINARY_INV)
 
-        # Morphological closing to merge roof regions and remove small holes
+        # Морфологическое закрытие для объединения областей крыш и удаления маленьких дырок
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # Edge detection on closed image
+        # Обнаружение краев на закрытом изображении
         edges = cv2.Canny(closed, 30, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         buildings = []
-        print(f"Found {len(contours)} contours")
+        print(f"Найдено {len(contours)} контуров")
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area:
                 continue
             peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)  # More lenient approximation
+            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)  # Более снисходительное приближение
             x, y, w, h = cv2.boundingRect(approx)
             rect_area = w * h
             if rect_area <= 0:
                 continue
             fill_ratio = area / float(rect_area)
-            # Relaxed criteria for buildings
-            if fill_ratio > 0.05 and w > 5 and h > 5 and len(approx) >= 3:  # At least triangle
+            # Ослабленные критерии для зданий
+            if fill_ratio > 0.05 and w > 5 and h > 5 and len(approx) >= 3:  # По крайней мере треугольник
                 buildings.append((x, y, x + w, y + h))
-        print(f"Detected {len(buildings)} buildings")
+        print(f"Обнаружено {len(buildings)} зданий")
         return buildings
 
-    # Build a downsampled occupancy grid and use A* to route.
+    # Построить downsampled occupancy grid и использовать A* для маршрутизации.
     def find_path_astar(start_px, goal_px, obstacle_mask, scale=8):
-        # Create matrix where 0 = walkable, 1 = blocked
+        # Создать матрицу, где 0 = проходимо, 1 = заблокировано
         h, w = obstacle_mask.shape
         gh = max(1, h // scale)
         gw = max(1, w // scale)
@@ -504,7 +506,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
                 y1 = min(h, y0 + scale)
                 x1 = min(w, x0 + scale)
                 block = obstacle_mask[y0:y1, x0:x1]
-                # If any obstacle pixel present, mark blocked
+                # Если присутствует хоть один пиксель препятствия, отметить заблокированным
                 if np.any(block > 0):
                     matrix[gy][gx] = 1
         grid = Grid(matrix=matrix)
@@ -514,7 +516,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
         path, runs = finder.find_path(start_node, end_node, grid)
         if not path:
             return None
-        # Convert path back to pixel coordinates (center of cell)
+        # Преобразовать путь обратно в координаты пикселей (центр ячейки)
         pixel_path = []
         for gx, gy in path:
             px = int(gx * scale + scale // 2)
@@ -523,7 +525,7 @@ def analyze_for_navigation(frame, detections, start_point=None):
         return pixel_path
 
     def smooth_path(path, window=3):
-        """Simple moving-average smoothing over the path coordinates."""
+        """Простое сглаживание скользящим средним по координатам пути."""
         if not path or len(path) < 3:
             return path
         smoothed = []
@@ -541,21 +543,21 @@ def analyze_for_navigation(frame, detections, start_point=None):
             smoothed.append((int(sx / cnt), int(sy / cnt)))
         return smoothed
 
-    # Compute paths and building detections synchronously
+    # Вычислить пути и обнаружения зданий синхронно
     def worker_compute_paths(result_dict):
         try:
-            print("Computing paths...")
+            print("Вычисление путей...")
             buildings = detect_buildings(frame)
-            # Removed limit to process all detected buildings
+            # Убрано ограничение для обработки всех обнаруженных зданий
             result_dict['buildings'] = buildings
             overlays = []
             labels = []
             worker_nav = nav_map.copy()
-            print(f"Detected {len(buildings)} building(s)")
+            print(f"Обнаружено {len(buildings)} зданий")
             for (bx1, by1, bx2, by2) in buildings:
                 center_x = (bx1 + bx2) // 2
                 center_y = (by1 + by2) // 2
-                astar_scale = 8  # Increased scale for faster computation
+                astar_scale = 8  # Увеличенный масштаб для более быстрого вычисления
                 path = find_path_astar((start_x, start_y), (center_x, center_y), obstacles, scale=astar_scale)
                 if path:
                     path = smooth_path(path, window=3)
@@ -581,19 +583,19 @@ def analyze_for_navigation(frame, detections, start_point=None):
             result_dict['nav_overlay'] = worker_nav
             result_dict['labels'] = labels
         except Exception as e:
-            print(f"Worker error: {e}")
+            print(f"Ошибка worker: {e}")
             result_dict['nav_overlay'] = nav_map.copy()
             result_dict['labels'] = []
 
     result = {}
     worker_compute_paths(result)
 
-    # If worker finished copy overlay and labels
+    # Если worker завершился, скопировать overlay и labels
     nav_map = result.get('nav_overlay', nav_map)
     for lab in result.get('labels', []):
         labels_to_draw.append(lab)
 
-    # Final step: draw all queued labels with PIL (gives correct Unicode rendering)
+    # Финальный шаг: нарисовать все поставленные labels с PIL (дает правильное отображение Unicode)
     try:
         pil_final = Image.fromarray(cv2.cvtColor(nav_map, cv2.COLOR_BGR2RGB))
         draw_final = ImageDraw.Draw(pil_final)
@@ -606,27 +608,27 @@ def analyze_for_navigation(frame, detections, start_point=None):
                 use_font = None
 
         for text, (tx, ty), color in labels_to_draw:
-            # draw a thin black outline for readability
+            # нарисовать тонкий черный контур для читаемости
             if use_font is not None:
                 outline_color = (0, 0, 0)
-                # offsets for pseudo-outline
+                # смещения для псевдо-контура
                 for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     draw_final.text((tx + ox, ty + oy), text, font=use_font, fill=outline_color)
                 draw_final.text((tx, ty), text, font=use_font, fill=tuple(color))
             else:
-                # fallback: do nothing
+                # резерв: ничего не делать
                 pass
 
         nav_map = cv2.cvtColor(np.array(pil_final), cv2.COLOR_RGB2BGR)
     except Exception as e:
-        print(f"Warning: failed to draw labels with PIL: {e}")
+        print(f"Предупреждение: не удалось нарисовать labels с PIL: {e}")
 
     return nav_map
 
 
 def is_path_clear(x1, y1, x2, y2, obstacles):
-    """Check if the line between two points avoids obstacles."""
-    # Simple check: sample points along the line
+    """Проверить, избегает ли линия между двумя точками препятствий."""
+    # Простая проверка: сэмплировать точки вдоль линии
     num_samples = 20
     for i in range(num_samples + 1):
         t = i / num_samples
@@ -642,23 +644,23 @@ def main(video_path=None, update_callback=None, show_intermediate=True, output_d
 
     if video_path is None:
         video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
-    print(f"Opening video file: {video_path}")
+    print(f"Открытие видеофайла: {video_path}")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("Ошибка: Не удалось открыть видеофайл")
         return
 
-    # Create Detections folder
+    # Создать папку Detections
     detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
     os.makedirs(detections_dir, exist_ok=True)
 
-    # Get total frame count for progress calculation
+    # Получить общее количество кадров для расчета прогресса
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames in video: {total_frames}")
+    print(f"Всего кадров в видео: {total_frames}")
     frame_count = 0
     is_first_frame = True
     first_frame_shape = None
-    print("Starting video processing and mosaic formation...")
+    print("Запуск обработки видео и формирования мозаики...")
     
     while cap.isOpened():
         ret, frame_cur = cap.read()
@@ -669,115 +671,115 @@ def main(video_path=None, update_callback=None, show_intermediate=True, output_d
 
         if is_first_frame:
             first_frame_shape = frame_cur.shape[:2]
-            video_mosaic = VideMosaic(frame_cur, detector_type="sift", show_intermediate=show_intermediate, output_dir=output_dir)
+            video_mosaic = VideMosaic(frame_cur, detector_type="sift", show_intermediate=show_intermediate, output_dir=output_dir, visualize=False)
             is_first_frame = False
-            # Calculate start point as bottom center of first frame in mosaic coordinates
+            # Рассчитать начальную точку как нижний-центр первого кадра в координатах мозаики
             start_x = video_mosaic.h_offset + first_frame_shape[1] // 2
             start_y = video_mosaic.w_offset + first_frame_shape[0]
             start_point = (start_x, start_y)
             continue
 
         frame_count += 1
-        # process each frame
+        # обработать каждый кадр
         video_mosaic.process_frame(frame_cur, frame_count)
         
-        # Update OpenCV windows
+        # Обновить окна OpenCV
         cv2.waitKey(1)
         
-        # Print progress every 50 frames
+        # Печатать прогресс каждые 50 кадров
         if frame_count % 50 == 0:
             progress = (frame_count / total_frames) * 100
-            print(f"Processed frame {frame_count}/{total_frames} ({progress:.1f}%)")
+            print(f"Обработан кадр {frame_count}/{total_frames} ({progress:.1f}%)")
             sys.stdout.flush()
         
-        # Check if user requested to quit during processing
+        # Проверить, запросил ли пользователь прервать во время обработки
         if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
-            print("Processing interrupted by user.")
+            print("Обработка прервана пользователем.")
             break
         
-        # Update progress if callback is provided
+        # Обновить прогресс, если предоставлен callback
         if update_callback:
             progress = (frame_count / total_frames) * 100
             update_callback(frame_count, video_mosaic.output_img.copy(), progress)
             
     cap.release()
-    print("Video processing completed. Mosaic formed.")
+    print("Обработка видео завершена. Мозаика сформирована.")
     sys.stdout.flush()
     
-    # Keep the final mosaic displayed until user closes it
+    # Держать финальную мозаику отображаемой до закрытия пользователем
     if show_intermediate:
-        print("Final mosaic completed. Press any key to close the window.")
+        print("Финальная мозаика завершена. Нажмите любую клавишу для закрытия окна.")
         # cv2.imshow('Mosaic Progress', video_mosaic.output_img)
-        # cv2.waitKey(0)  # Wait for any key press
+        # cv2.waitKey(0)  # Ждать любого нажатия клавиши
         cv2.destroyAllWindows()
     else:
         cv2.destroyAllWindows()
         
-    print("Cropping black areas from mosaic...")
+    print("Обрезка черных областей из мозаики...")
     try:
         cropped = crop_black_areas(video_mosaic.output_img)
-        print(f"Cropped mosaic size: {cropped.shape[1]}x{cropped.shape[0]}")
+        print(f"Размер обрезанной мозаики: {cropped.shape[1]}x{cropped.shape[0]}")
     except Exception as e:
-        print(f"Warning: crop failed, using full mosaic: {e}")
+        print(f"Предупреждение: обрезка не удалась, используется полная мозаика: {e}")
         cropped = video_mosaic.output_img
 
-    print("Scaling mosaic to screen (preserving aspect)...")
+    print("Масштабирование мозаики к экрану (с сохранением соотношения)...")
     try:
         scaled_mosaic = scale_to_screen(cropped)
-        print(f"Scaled mosaic size: {scaled_mosaic.shape[1]}x{scaled_mosaic.shape[0]}")
+        print(f"Размер масштабированной мозаики: {scaled_mosaic.shape[1]}x{scaled_mosaic.shape[0]}")
     except Exception as e:
-        print(f"Warning: scaling failed, saving original: {e}")
+        print(f"Предупреждение: масштабирование не удалось, сохраняется оригинал: {e}")
         scaled_mosaic = cropped
 
-    print("Saving mosaic image...")
+    print("Сохранение изображения мозаики...")
     mosaic_path = os.path.join(output_dir, 'mosaic.jpg') if output_dir else 'mosaic.jpg'
     cv2.imwrite(mosaic_path, scaled_mosaic)
-    print(f"Mosaic saved as '{mosaic_path}'")
+    print(f"Мозаика сохранена как '{mosaic_path}'")
 
-    # Detect objects on the mosaic
-    print("Detecting objects on the mosaic...")
+    # Обнаружить объекты на мозаике
+    print("Обнаружение объектов на мозаике...")
     detections = video_mosaic.detect_objects(video_mosaic.output_img.astype(np.uint8))
-    print(f"Detected {len(detections)} objects on the mosaic.")
+    print(f"Обнаружено {len(detections)} объектов на мозаике.")
 
-    # Optionally analyze mosaic for navigation: mark obstacles and draw paths to objects
-    # Commenting out the navigation map creation as per user request
-    print("Analyzing mosaic for navigation...")
+    # Опционально проанализировать мозаику для навигации: отметить препятствия и нарисовать пути к объектам
+    # Закомментировано создание карты навигации по запросу пользователя
+    print("Анализ мозаики для навигации...")
     navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), detections, start_point=start_point)
-    print("Scaling navigation map to screen...")
+    print("Масштабирование карты навигации к экрану...")
     try:
         scaled_nav = scale_to_screen(navigation_map)
     except Exception:
         scaled_nav = navigation_map
-    print("Saving navigation map...")
+    print("Сохранение карты навигации...")
     nav_path = os.path.join(output_dir, 'navigation_map.jpg') if output_dir else 'navigation_map.jpg'
     cv2.imwrite(nav_path, scaled_nav)
-    print(f"Navigation map saved as '{nav_path}'")
+    print(f"Карта навигации сохранена как '{nav_path}'")
     sys.stdout.flush()
     if show_intermediate:
         cv2.imshow('Navigation Map', scaled_nav)
         cv2.waitKey(1)
     if show_intermediate:
         cv2.imshow('Navigation Map', navigation_map)
-        print("Navigation map displayed. Press any key in the window to continue.")
+        print("Карта навигации отображена. Нажмите любую клавишу в окне для продолжения.")
     
-    # Close all OpenCV windows at the end of the program
+    # Закрыть все окна OpenCV в конце программы
     cv2.destroyAllWindows()
     
-    # Check if processing was interrupted by user
+    # Проверить, была ли обработка прервана пользователем
     if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
-        print("Video mosaic generation was interrupted by user.")
+        print("Генерация мозаики видео была прервана пользователем.")
         return
     
-    # Final update with completion
+    # Финальное обновление с завершением
     if update_callback:
         update_callback(frame_count, video_mosaic.output_img.copy(), 100)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Video Mosaic Processor')
-    parser.add_argument('video_path', nargs='?', default=None, help='Path to the video file')
-    parser.add_argument('--output-dir', default=None, help='Output directory for results')
-    parser.add_argument('--no-gui', action='store_true', help='Disable GUI windows')
+    parser = argparse.ArgumentParser(description='Процессор Мозаики Видео')
+    parser.add_argument('video_path', nargs='?', default=None, help='Путь к видеофайлу')
+    parser.add_argument('--output-dir', default=None, help='Каталог вывода для результатов')
+    parser.add_argument('--no-gui', action='store_true', help='Отключить окна GUI')
     
     args = parser.parse_args()
     
