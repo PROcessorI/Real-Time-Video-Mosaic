@@ -128,6 +128,109 @@ class VideMosaic:
                     'box': (int(x1), int(y1), int(x2), int(y2)),
                     'confidence': confidence
                 })
+        
+        # Добавить детекцию огня и дыма по цвету
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        b, g, r = cv2.split(frame)
+        
+        # Детекция огня - комбинация HSV и BGR анализа
+        lower_fire1 = np.array([0, 80, 100])
+        upper_fire1 = np.array([15, 255, 255])
+        mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
+        lower_fire2 = np.array([165, 80, 100])
+        upper_fire2 = np.array([180, 255, 255])
+        mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
+        mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
+        
+        # Дополнительная проверка: красный канал > синий и зеленый
+        fire_bgr_mask = ((r > g + 20) & (r > b + 30) & (r > 100)).astype(np.uint8) * 255
+        mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
+        
+        # Морфологическая обработка
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
+        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
+        
+        # Детекция дыма - низкая насыщенность, средняя яркость
+        lower_smoke = np.array([0, 0, 80])
+        upper_smoke = np.array([180, 50, 230])
+        mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
+        
+        # Дополнительная проверка: близкие значения RGB (серый цвет)
+        smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 30) & 
+                         (np.abs(g.astype(int) - b.astype(int)) < 30) & 
+                         (r > 60)).astype(np.uint8) * 255
+        mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
+        
+        # Морфологическая обработка
+        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
+        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
+        
+        # Найти контуры для огня
+        fire_detections = []
+        contours_fire, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours_fire:
+            area = cv2.contourArea(cnt)
+            if area > 300:
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Проверка плотности заполнения контура
+                density = area / (w * h) if w * h > 0 else 0
+                if density > 0.3:
+                    fire_detections.append({
+                        'class': 'fire',
+                        'box': (x, y, x + w, y + h),
+                        'confidence': 0.8,
+                        'area': area
+                    })
+        
+        # Найти контуры для дыма
+        smoke_detections = []
+        contours_smoke, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours_smoke:
+            area = cv2.contourArea(cnt)
+            if area > 500:
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Проверка плотности и формы
+                density = area / (w * h) if w * h > 0 else 0
+                if density > 0.2:
+                    smoke_detections.append({
+                        'class': 'smoke',
+                        'box': (x, y, x + w, y + h),
+                        'confidence': 0.7,
+                        'area': area
+                    })
+        
+        # Применить NMS для удаления перекрывающихся боксов
+        def apply_nms(dets, iou_threshold=0.5):
+            if not dets:
+                return []
+            dets_sorted = sorted(dets, key=lambda x: x['area'], reverse=True)
+            keep = []
+            while dets_sorted:
+                current = dets_sorted.pop(0)
+                keep.append(current)
+                x1, y1, x2, y2 = current['box']
+                dets_sorted = [d for d in dets_sorted if 
+                              calculate_iou((x1, y1, x2, y2), d['box']) < iou_threshold]
+            return keep
+        
+        def calculate_iou(box1, box2):
+            x1, y1, x2, y2 = box1
+            x3, y3, x4, y4 = box2
+            xi1, yi1 = max(x1, x3), max(y1, y3)
+            xi2, yi2 = min(x2, x4), min(y2, y4)
+            inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+            box1_area = (x2 - x1) * (y2 - y1)
+            box2_area = (x4 - x3) * (y4 - y3)
+            union_area = box1_area + box2_area - inter_area
+            return inter_area / union_area if union_area > 0 else 0
+        
+        # Применить NMS и добавить к результатам
+        for det in apply_nms(fire_detections, 0.4):
+            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
+        for det in apply_nms(smoke_detections, 0.4):
+            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
+        
         return detections
 
     def match(self, des_cur, des_prev):
@@ -185,27 +288,6 @@ class VideMosaic:
 
         self.warp(self.frame_cur, self.H)
 
-        people_boxes = self.detect_people(self.frame_cur)
-        for box in people_boxes:
-            x1, y1, x2, y2 = box
-            corners = np.array([[[x1, y1], [x2, y1], [x2, y2], [x1, y2]]], dtype=np.float32)
-            transformed_corners = cv2.perspectiveTransform(corners, self.H)
-            try:
-                cv2.rectangle(self.output_img, tuple(transformed_corners[0][0].astype(int)), tuple(transformed_corners[0][2].astype(int)), (0, 255, 0), 2)
-            except Exception:
-                pass
-        detections = self.detect_objects(self.frame_cur)
-        for det in detections:
-            x1, y1, x2, y2 = det['box']
-            cv2.rectangle(self.frame_cur, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            # Отобразить имя класса и оценку уверенности
-            label = f"{det['class']} {det['confidence']:.2f}"
-            cv2.putText(self.frame_cur, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        if detections:
-            detections_dir = os.path.join(self.output_dir, 'Detections') if self.output_dir else 'Detections'
-            os.makedirs(detections_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(detections_dir, f'frame_{frame_count}.jpg'), self.frame_cur)
-
         # Обновить промежуточные окна, если включено
         # if self.show_intermediate:
         #     cv2.imshow('Mosaic Progress', self.output_img.astype(np.uint8))
@@ -255,9 +337,51 @@ class VideMosaic:
         warped_img = cv2.warpPerspective(frame_cur, H, (self.output_img.shape[1], self.output_img.shape[0]), flags=cv2.INTER_LINEAR)
 
         transformed_corners = self.get_transformed_corners(frame_cur, H)
-        warped_img = self.draw_border(warped_img, transformed_corners)
+        # Убрано рисование черной границы: warped_img = self.draw_border(warped_img, transformed_corners)
 
-        self.output_img[warped_img > 0] = warped_img[warped_img > 0]
+        # Применить улучшенный блендинг с плавными переходами
+        # Создать маску для нового кадра (одноканальную)
+        mask_new = np.any(warped_img > 0, axis=2).astype(np.uint8) * 255
+        mask_old = np.any(self.output_img > 0, axis=2).astype(np.uint8) * 255
+        
+        # Найти области перекрытия
+        overlap = cv2.bitwise_and(mask_new, mask_old)
+        
+        # Создать весовую маску с расстоянием от краёв для плавного перехода
+        if np.any(overlap):
+            # Вычислить расстояние от краёв для обеих масок
+            dist_new = cv2.distanceTransform(mask_new, cv2.DIST_L2, 5)
+            dist_old = cv2.distanceTransform(mask_old, cv2.DIST_L2, 5)
+            
+            # Нормализовать расстояния для весов
+            dist_sum = dist_new + dist_old + 1e-6
+            weight_new = dist_new / dist_sum
+            weight_old = dist_old / dist_sum
+            
+            # Применить сильное размытие для очень плавных переходов
+            weight_new = cv2.GaussianBlur(weight_new.astype(np.float32), (51, 51), 0)
+            weight_old = cv2.GaussianBlur(weight_old.astype(np.float32), (51, 51), 0)
+            
+            # Расширить до 3 каналов
+            weight_new_3ch = np.stack([weight_new, weight_new, weight_new], axis=2)
+            weight_old_3ch = np.stack([weight_old, weight_old, weight_old], axis=2)
+            
+            # Плавное смешивание с учётом расстояния от краёв
+            blended = (self.output_img.astype(np.float32) * weight_old_3ch + 
+                      warped_img.astype(np.float32) * weight_new_3ch)
+            
+            # Применить блендинг только в области перекрытия
+            overlap_3ch = np.stack([overlap, overlap, overlap], axis=2) > 0
+            self.output_img = np.where(overlap_3ch, blended.astype(np.uint8), self.output_img)
+            
+            # В неперекрывающихся областях просто заменить
+            non_overlap_new = cv2.bitwise_and(mask_new, cv2.bitwise_not(overlap)) > 0
+            non_overlap_3ch = np.stack([non_overlap_new, non_overlap_new, non_overlap_new], axis=2)
+            self.output_img = np.where(non_overlap_3ch, warped_img, self.output_img)
+        else:
+            # Нет перекрытия, просто заменить
+            self.output_img[warped_img > 0] = warped_img[warped_img > 0]
+        
         output_temp = np.copy(self.output_img)
         output_temp = self.draw_border(output_temp, transformed_corners, color=(0, 0, 255))
         
@@ -309,12 +433,26 @@ class VideMosaic:
         return image
 
 
-def crop_black_areas(image):
+def crop_black_areas(image, threshold=15, margin=5):
+    """Обрезать черные области и темные артефакты на краях.
+    
+    Args:
+        image: Входное изображение
+        threshold: Порог яркости (пиксели < threshold считаются черными)
+        margin: Отступ от краев после обрезки
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    coords = cv2.findNonZero(gray)
+    # Использовать порог для игнорирования очень темных пикселей
+    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(thresh)
     if coords is None:
         return image
     x, y, w, h = cv2.boundingRect(coords)
+    # Добавить отступ от краев для удаления тонких артефактов
+    x = max(0, x + margin)
+    y = max(0, y + margin)
+    w = min(image.shape[1] - x, w - 2 * margin)
+    h = min(image.shape[0] - y, h - 2 * margin)
     return image[y:y+h, x:x+w]
 
 
@@ -363,30 +501,87 @@ def draw_dotted_line(img, pt1, pt2, color, thickness):
         cv2.circle(img, (px, py), thickness, color, -1)
 
 
-def analyze_for_navigation(frame, detections, start_point=None):
+def analyze_for_navigation(frame, detections, start_point=None, compute_paths=True):
     """Простой анализ для навигации: отметить препятствия и нарисовать пути к объектам на одном кадре.
 
     Args:
         frame (np массив): последний кадр
         detections (list): список обнаруженных объектов
+        start_point: начальная точка для навигации
+        compute_paths: вычислять ли пути к зданиям (медленно для изображений)
 
     Returns:
         np массив: кадр с отмеченными препятствиями и путями
     """
     labels_to_draw = []
-    # Преобразовать в HSV для лучшего обнаружения цвета
+    # Преобразовать в HSV для детекции огня и дыма по цветам
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Определить диапазоны цветов для препятствий (упрощено)
-    lower_green = np.array([35, 50, 50])
-    upper_green = np.array([80, 255, 255])
-    mask_green = cv2.inRange(hsv, lower_green, upper_green)
+    # Создать маску препятствий на основе обнаруженных объектов
+    obstacles = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
 
-    lower_blue = np.array([90, 50, 50])
-    upper_blue = np.array([130, 255, 255])
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+    # Добавить буфер вокруг обнаруженных объектов для более безопасных препятствий
+    # Расширенный список классов и увеличенные буферы
+    for det in detections:
+        if det['class'] in ['person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle', 
+                           'dog', 'horse', 'cat', 'bird', 'cow', 'sheep',
+                           'smoke', 'fire', 'building']:
+            x1, y1, x2, y2 = det['box']
+            # Увеличенный буфер безопасности в зависимости от типа объекта
+            if det['class'] in ['fire', 'smoke']:
+                buffer = 30  # Больший буфер для опасных объектов
+            elif det['class'] in ['car', 'truck', 'bus']:
+                buffer = 20  # Средний буфер для транспорта
+            else:
+                buffer = 15  # Стандартный буфер
+            
+            cv2.rectangle(obstacles, 
+                         (max(0, x1-buffer), max(0, y1-buffer)), 
+                         (min(obstacles.shape[1], x2+buffer), min(obstacles.shape[0], y2+buffer)), 
+                         255, -1)
 
-    obstacles = cv2.bitwise_or(mask_green, mask_blue)
+    # Добавить цветовую детекцию огня и дыма для препятствий (мягкие пороги для карты)
+    # Эти маски нужны для визуализации красных контуров препятствий, не для боксов
+    b_nav, g_nav, r_nav = cv2.split(frame)
+    
+    # Огонь - мягкие пороги для карты препятствий
+    lower_fire1 = np.array([0, 100, 100])
+    upper_fire1 = np.array([15, 255, 255])
+    mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
+    lower_fire2 = np.array([165, 100, 100])
+    upper_fire2 = np.array([180, 255, 255])
+    mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
+    mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
+    
+    # Простая BGR проверка для огня
+    fire_bgr_mask = ((r_nav > g_nav + 20) & (r_nav > b_nav + 30) & (r_nav > 100)).astype(np.uint8) * 255
+    mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
+    
+    # Морфологическая обработка
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
+    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
+    obstacles = cv2.bitwise_or(obstacles, mask_fire)
+    
+    # Дым - мягкие пороги для карты препятствий
+    lower_smoke = np.array([0, 0, 80])
+    upper_smoke = np.array([180, 50, 230])
+    mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
+    
+    # Простая BGR проверка для дыма
+    smoke_bgr_mask = ((np.abs(r_nav.astype(int) - g_nav.astype(int)) < 30) &
+                     (np.abs(g_nav.astype(int) - b_nav.astype(int)) < 30) &
+                     (r_nav > 70) & (g_nav > 70) & (b_nav > 70)).astype(np.uint8) * 255
+    mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
+    
+    # Морфологическая обработка
+    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
+    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
+    obstacles = cv2.bitwise_or(obstacles, mask_smoke)
+
+    # Расширить препятствия для большей безопасности
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    obstacles = cv2.dilate(obstacles, kernel, iterations=2)
 
     # Отметить препятствия как контуры на копии кадра
     nav_map = frame.copy()
@@ -452,11 +647,42 @@ def analyze_for_navigation(frame, detections, start_point=None):
     nav_map = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     # Отметить объекты на карте без рисования маршрутов
+    # Словарь для перевода названий классов на русский
+    class_names_ru = {
+        'person': 'Человек',
+        'car': 'Машина',
+        'truck': 'Грузовик',
+        'bus': 'Автобус',
+        'motorcycle': 'Мотоцикл',
+        'bicycle': 'Велосипед',
+        'dog': 'Собака',
+        'horse': 'Лошадь',
+        'cat': 'Кот',
+        'bird': 'Птица',
+        'cow': 'Корова',
+        'sheep': 'Овца',
+        'smoke': 'Дым',
+        'fire': 'Огонь',
+        'building': 'Здание'
+    }
+    
     for det in detections:
-        if det['class'] in ['person', 'car', 'truck', 'dog', 'horse', 'cat']:  # Ключевые объекты
+        if det['class'] in class_names_ru:  # Отображать все известные объекты
             x1, y1, x2, y2 = det['box']
-            # Отметить объект
-            cv2.rectangle(nav_map, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Желтый для объектов
+            # Цвет в зависимости от опасности
+            if det['class'] in ['fire', 'smoke']:
+                color = (0, 0, 255)  # Красный для опасных объектов
+            elif det['class'] in ['car', 'truck', 'bus', 'motorcycle']:
+                color = (0, 165, 255)  # Оранжевый для транспорта
+            else:
+                color = (0, 255, 255)  # Желтый для остальных
+            
+            cv2.rectangle(nav_map, (x1, y1), (x2, y2), color, 2)
+            # Добавить подпись с процентом уверенности
+            label_text = class_names_ru.get(det['class'], det['class'])
+            confidence_pct = det.get('confidence', 1.0) * 100
+            label_with_conf = f"{label_text} {confidence_pct:.0f}%"
+            labels_to_draw.append((label_with_conf, (x1, max(5, y1 - 18)), color))
 
     # --- Новое: обнаружить цели типа зданий на мозаике (прямоугольные, большие контуры)
     def detect_buildings(img, min_area=30):
@@ -488,7 +714,15 @@ def analyze_for_navigation(frame, detections, start_point=None):
             fill_ratio = area / float(rect_area)
             # Ослабленные критерии для зданий
             if fill_ratio > 0.05 and w > 5 and h > 5 and len(approx) >= 3:  # По крайней мере треугольник
-                buildings.append((x, y, x + w, y + h))
+                # Вычислить уверенность на основе fill_ratio, размера и прямоугольности
+                # fill_ratio близко к 1.0 = более прямоугольное = выше уверенность
+                # Большая площадь = более вероятно здание
+                size_confidence = min(1.0, area / 1000.0)  # Нормализовать по размеру
+                shape_confidence = fill_ratio  # 0.05-1.0 диапазон
+                # Комбинированная уверенность (60% форма, 40% размер)
+                confidence = (shape_confidence * 0.6 + size_confidence * 0.4)
+                confidence = min(0.95, max(0.50, confidence))  # Ограничить 50-95%
+                buildings.append((x, y, x + w, y + h, confidence))
         print(f"Обнаружено {len(buildings)} зданий")
         return buildings
 
@@ -548,13 +782,26 @@ def analyze_for_navigation(frame, detections, start_point=None):
         try:
             print("Вычисление путей...")
             buildings = detect_buildings(frame)
-            # Убрано ограничение для обработки всех обнаруженных зданий
+            
             result_dict['buildings'] = buildings
             overlays = []
             labels = []
             worker_nav = nav_map.copy()
             print(f"Обнаружено {len(buildings)} зданий")
-            for (bx1, by1, bx2, by2) in buildings:
+            
+            # Пропустить построение путей если compute_paths=False
+            if not compute_paths:
+                for building in buildings:
+                    bx1, by1, bx2, by2, confidence = building
+                    cv2.rectangle(worker_nav, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
+                    label_with_conf = f"Здание {confidence*100:.0f}%"
+                    labels.append((label_with_conf, (bx1, max(5, by1 - 18)), (0, 255, 255)))
+                result_dict['nav_overlay'] = worker_nav
+                result_dict['labels'] = labels
+                return
+            
+            for building in buildings:
+                bx1, by1, bx2, by2, confidence = building
                 center_x = (bx1 + bx2) // 2
                 center_y = (by1 + by2) // 2
                 astar_scale = 8  # Увеличенный масштаб для более быстрого вычисления
@@ -579,7 +826,8 @@ def analyze_for_navigation(frame, detections, start_point=None):
                         else:
                             draw_dotted_line(worker_nav, (start_x, start_y), (center_x, center_y), (0, 255, 0), 2)
                 cv2.rectangle(worker_nav, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
-                labels.append(("Здание", (bx1, max(5, by1 - 18)), (0, 255, 255)))
+                label_with_conf = f"Здание {confidence*100:.0f}%"
+                labels.append((label_with_conf, (bx1, max(5, by1 - 18)), (0, 255, 255)))
             result_dict['nav_overlay'] = worker_nav
             result_dict['labels'] = labels
         except Exception as e:
@@ -607,7 +855,12 @@ def analyze_for_navigation(frame, detections, start_point=None):
             except Exception:
                 use_font = None
 
+        img_height, img_width = nav_map.shape[:2]
         for text, (tx, ty), color in labels_to_draw:
+            # Ограничить координаты границами изображения
+            tx = max(5, min(tx, img_width - 100))  # 100px запас справа для текста
+            ty = max(20, min(ty, img_height - 5))  # 20px сверху, 5px снизу
+            
             # нарисовать тонкий черный контур для читаемости
             if use_font is not None:
                 outline_color = (0, 0, 0)
@@ -640,76 +893,277 @@ def is_path_clear(x1, y1, x2, y2, obstacles):
     return True
 
 
-def main(video_path=None, update_callback=None, show_intermediate=True, output_dir=None):
+def main(video_path=None, images_dir=None, update_callback=None, show_intermediate=True, output_dir=None):
 
-    if video_path is None:
-        video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
-    print(f"Открытие видеофайла: {video_path}")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Ошибка: Не удалось открыть видеофайл")
-        return
-
-    # Создать папку Detections
-    detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
-    os.makedirs(detections_dir, exist_ok=True)
-
-    # Получить общее количество кадров для расчета прогресса
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Всего кадров в видео: {total_frames}")
-    frame_count = 0
-    is_first_frame = True
-    first_frame_shape = None
-    print("Запуск обработки видео и формирования мозаики...")
-    
-    while cap.isOpened():
-        ret, frame_cur = cap.read()
-        if not ret:
-            if is_first_frame:
-                continue
-            break
-
-        if is_first_frame:
-            first_frame_shape = frame_cur.shape[:2]
-            video_mosaic = VideMosaic(frame_cur, detector_type="sift", show_intermediate=show_intermediate, output_dir=output_dir, visualize=False)
-            is_first_frame = False
-            # Рассчитать начальную точку как нижний-центр первого кадра в координатах мозаики
-            start_x = video_mosaic.h_offset + first_frame_shape[1] // 2
-            start_y = video_mosaic.w_offset + first_frame_shape[0]
-            start_point = (start_x, start_y)
-            continue
-
-        frame_count += 1
-        # обработать каждый кадр
-        video_mosaic.process_frame(frame_cur, frame_count)
+    if images_dir:
+        import glob
+        image_files = sorted(glob.glob(os.path.join(images_dir, '*.jpg')) + glob.glob(os.path.join(images_dir, '*.png')))
+        if not image_files:
+            print("Нет изображений в указанной папке")
+            return
         
-        # Обновить окна OpenCV
-        cv2.waitKey(1)
+        # Создать папку Detections
+        detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
+        os.makedirs(detections_dir, exist_ok=True)
         
-        # Печатать прогресс каждые 50 кадров
-        if frame_count % 50 == 0:
-            progress = (frame_count / total_frames) * 100
-            print(f"Обработан кадр {frame_count}/{total_frames} ({progress:.1f}%)")
-            sys.stdout.flush()
+        # Загрузить модель YOLO
+        try:
+            model = YOLO('yolo11n.pt')
+        except Exception as e:
+            print(f"Ошибка загрузки модели YOLO: {e}")
+            return
         
-        # Проверить, запросил ли пользователь прервать во время обработки
-        if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
-            print("Обработка прервана пользователем.")
-            break
-        
-        # Обновить прогресс, если предоставлен callback
-        if update_callback:
-            progress = (frame_count / total_frames) * 100
-            update_callback(frame_count, video_mosaic.output_img.copy(), progress)
+        def detect_objects_static(frame, model):
+            original_shape = frame.shape[:2]
+            resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
+            results = model.predict(resized, conf=0.4, iou=0.45, imgsz=640, verbose=False)
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    scale_x = original_shape[1] / 640
+                    scale_y = original_shape[0] / 640
+                    x1 *= scale_x
+                    x2 *= scale_x
+                    y1 *= scale_y
+                    y2 *= scale_y
+                    class_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    class_name = model.names[class_id] if hasattr(model, 'names') else str(class_id)
+                    detections.append({
+                        'class': class_name, 
+                        'box': (int(x1), int(y1), int(x2), int(y2)),
+                        'confidence': confidence
+                    })
             
-    cap.release()
-    print("Обработка видео завершена. Мозаика сформирована.")
-    sys.stdout.flush()
+            # Добавить детекцию огня и дыма по цвету
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            b, g, r = cv2.split(frame)
+            
+            # Детекция огня - комбинация HSV и BGR анализа (очень строгие пороги)
+            lower_fire1 = np.array([0, 130, 170])
+            upper_fire1 = np.array([10, 255, 255])
+            mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
+            lower_fire2 = np.array([170, 130, 170])
+            upper_fire2 = np.array([180, 255, 255])
+            mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
+            mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
+            
+            # Дополнительная проверка: очень яркий красный, сильно доминирует над G и B
+            fire_bgr_mask = ((r > g + 40) & (r > b + 50) & (r > 180)).astype(np.uint8) * 255
+            mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
+            
+            # Морфологическая обработка
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
+            mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
+
+            # Детекция дыма - низкая насыщенность, высокая яркость
+            lower_smoke = np.array([0, 0, 130])
+            upper_smoke = np.array([180, 35, 230])
+            mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
+            
+            # Дополнительная проверка: очень близкие значения RGB (серый цвет) и высокая яркость
+            smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 15) & 
+                             (np.abs(g.astype(int) - b.astype(int)) < 15) & 
+                             (r > 130) & (g > 130) & (b > 130)).astype(np.uint8) * 255
+            mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
+            
+            # Исключить тени по яркости
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            bright_mask = (gray > 130).astype(np.uint8) * 255
+            mask_smoke = cv2.bitwise_and(mask_smoke, bright_mask)
+            
+            # Морфологическая обработка
+            mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
+            mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
+            
+            # Найти контуры для огня
+            fire_detections = []
+            contours_fire, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours_fire:
+                area = cv2.contourArea(cnt)
+                if area > 800:  # Увеличена минимальная площадь
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    # Проверка плотности заполнения контура
+                    density = area / (w * h) if w * h > 0 else 0
+                    if density > 0.35:  # Более строгая проверка
+                        # Дополнительная проверка контраста в области
+                        roi = frame[y:y+h, x:x+w]
+                        if roi.size > 0:
+                            roi_r = roi[:, :, 2]
+                            max_r = np.max(roi_r)
+                            mean_r = np.mean(roi_r)
+                            # Огонь имеет высокий контраст в красном канале
+                            if max_r > 200 and (max_r - mean_r) > 50:
+                                fire_detections.append({
+                                    'class': 'fire',
+                                    'box': (x, y, x + w, y + h),
+                                    'confidence': 0.9,
+                                    'area': area
+                                })
+            
+            # Найти контуры для дыма
+            smoke_detections = []
+            contours_smoke, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours_smoke:
+                area = cv2.contourArea(cnt)
+                if area < 2000:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Проверка плотности и формы
+                density = area / (w * h) if w * h > 0 else 0
+                if density < 0.35:
+                    continue
+                roi = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+                if roi.size == 0:
+                    continue
+                std_dev = np.std(roi)
+                mean_val = np.mean(roi)
+                if not (mean_val > 135 and std_dev < 35):
+                    continue
+                smoke_detections.append({
+                    'class': 'smoke',
+                    'box': (x, y, x + w, y + h),
+                    'confidence': 0.9,
+                    'area': area
+                })
+            
+            # Применить NMS для удаления перекрывающихся боксов
+            def apply_nms(dets, iou_threshold=0.5):
+                if not dets:
+                    return []
+                dets_sorted = sorted(dets, key=lambda x: x['area'], reverse=True)
+                keep = []
+                while dets_sorted:
+                    current = dets_sorted.pop(0)
+                    keep.append(current)
+                    x1, y1, x2, y2 = current['box']
+                    dets_sorted = [d for d in dets_sorted if 
+                                  calculate_iou((x1, y1, x2, y2), d['box']) < iou_threshold]
+                return keep
+            
+            def calculate_iou(box1, box2):
+                x1, y1, x2, y2 = box1
+                x3, y3, x4, y4 = box2
+                xi1, yi1 = max(x1, x3), max(y1, y3)
+                xi2, yi2 = min(x2, x4), min(y2, y4)
+                inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+                box1_area = (x2 - x1) * (y2 - y1)
+                box2_area = (x4 - x3) * (y4 - y3)
+                union_area = box1_area + box2_area - inter_area
+                return inter_area / union_area if union_area > 0 else 0
+            
+            # Применить NMS и добавить к результатам
+            for det in apply_nms(fire_detections, 0.4):
+                detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
+            for det in apply_nms(smoke_detections, 0.4):
+                detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
+            
+            return detections
+        
+        print(f"Найдено {len(image_files)} изображений для обработки")
+        for image_path in image_files:
+            frame = cv2.imread(image_path)
+            if frame is None:
+                print(f"Не удалось загрузить {image_path}")
+                continue
+            
+            detections = detect_objects_static(frame, model)
+            
+            # Создать навигационную карту с детекциями (без построения путей для скорости)
+            nav_map = analyze_for_navigation(frame, detections, compute_paths=False)
+            
+            # Нарисовать bounding boxes на оригинальном изображении
+            detected_frame = frame.copy()
+            for det in detections:
+                x1, y1, x2, y2 = det['box']
+                cv2.rectangle(detected_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                label = f"{det['class']} {det['confidence']:.2f}"
+                cv2.putText(detected_frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            
+            # Сохранить изображение с detections
+            base_name = os.path.basename(image_path)
+            name, ext = os.path.splitext(base_name)
+            out_path = os.path.join(detections_dir, f"{name}_detected{ext}")
+            cv2.imwrite(out_path, detected_frame)
+            
+            # Сохранить навигационную карту
+            nav_path = os.path.join(detections_dir, f"{name}_navigation{ext}")
+            cv2.imwrite(nav_path, nav_map)
+            
+            print(f"Обработано {base_name}: {len(detections)} объектов")
+        
+        print("Обработка изображений завершена.")
+        return
+        
+    else:
+        if video_path is None:
+            video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
+        print(f"Открытие видеофайла: {video_path}")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("Ошибка: Не удалось открыть видеофайл")
+            return
+
+        # Создать папку Detections
+        detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
+        os.makedirs(detections_dir, exist_ok=True)
+
+        # Получить общее количество кадров для расчета прогресса
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Всего кадров в видео: {total_frames}")
+        frame_count = 0
+        is_first_frame = True
+        first_frame_shape = None
+        print("Запуск обработки видео и формирования мозаики...")
+        
+        while cap.isOpened():
+            ret, frame_cur = cap.read()
+            if not ret:
+                break
+
+            if is_first_frame:
+                first_frame_shape = frame_cur.shape[:2]
+                video_mosaic = VideMosaic(frame_cur, detector_type="sift", show_intermediate=show_intermediate, output_dir=output_dir, visualize=show_intermediate)
+                is_first_frame = False
+                # Рассчитать начальную точку как нижний-центр первого кадра в координатах мозаики
+                start_x = video_mosaic.h_offset + first_frame_shape[1] // 2
+                start_y = video_mosaic.w_offset + first_frame_shape[0]
+                start_point = (start_x, start_y)
+                continue
+
+            frame_count += 1
+            # обработать каждый кадр
+            video_mosaic.process_frame(frame_cur, frame_count)
+            
+            # Обновить окна OpenCV
+            cv2.waitKey(1)
+            
+            # Печатать прогресс каждые 50 кадров
+            if frame_count % 50 == 0:
+                progress = (frame_count / total_frames) * 100
+                print(f"Обработан кадр {frame_count}/{total_frames} ({progress:.1f}%)")
+                sys.stdout.flush()
+            
+            # Проверить, запросил ли пользователь прервать во время обработки
+            if hasattr(video_mosaic, 'quit_requested') and video_mosaic.quit_requested:
+                print("Обработка прервана пользователем.")
+                break
+            
+            # Обновить прогресс, если предоставлен callback
+            if update_callback:
+                progress = (frame_count / total_frames) * 100
+                update_callback(frame_count, video_mosaic.output_img.copy(), progress)
+                
+        cap.release()
+        print("Обработка видео завершена. Мозаика сформирована.")
+        sys.stdout.flush()
     
     # Держать финальную мозаику отображаемой до закрытия пользователем
     if show_intermediate:
         print("Финальная мозаика завершена. Нажмите любую клавишу для закрытия окна.")
-        # cv2.imshow('Mosaic Progress', video_mosaic.output_img)
+        cv2.imshow('Mosaic Progress', video_mosaic.output_img)
         # cv2.waitKey(0)  # Ждать любого нажатия клавиши
         cv2.destroyAllWindows()
     else:
@@ -717,7 +1171,7 @@ def main(video_path=None, update_callback=None, show_intermediate=True, output_d
         
     print("Обрезка черных областей из мозаики...")
     try:
-        cropped = crop_black_areas(video_mosaic.output_img)
+        cropped = crop_black_areas(video_mosaic.output_img, threshold=80, margin=30)
         print(f"Размер обрезанной мозаики: {cropped.shape[1]}x{cropped.shape[0]}")
     except Exception as e:
         print(f"Предупреждение: обрезка не удалась, используется полная мозаика: {e}")
@@ -739,12 +1193,15 @@ def main(video_path=None, update_callback=None, show_intermediate=True, output_d
     # Обнаружить объекты на мозаике
     print("Обнаружение объектов на мозаике...")
     detections = video_mosaic.detect_objects(video_mosaic.output_img.astype(np.uint8))
-    print(f"Обнаружено {len(detections)} объектов на мозаике.")
+    # fire_smoke_detections = video_mosaic.detect_fire_smoke(video_mosaic.output_img.astype(np.uint8))
+    # all_detections = detections + fire_smoke_detections
+    all_detections = detections
+    print(f"Обнаружено {len(all_detections)} объектов на мозаике.")
 
     # Опционально проанализировать мозаику для навигации: отметить препятствия и нарисовать пути к объектам
     # Закомментировано создание карты навигации по запросу пользователя
     print("Анализ мозаики для навигации...")
-    navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), detections, start_point=start_point)
+    navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), all_detections, start_point=start_point)
     print("Масштабирование карты навигации к экрану...")
     try:
         scaled_nav = scale_to_screen(navigation_map)
@@ -778,10 +1235,14 @@ def main(video_path=None, update_callback=None, show_intermediate=True, output_d
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Процессор Мозаики Видео')
     parser.add_argument('video_path', nargs='?', default=None, help='Путь к видеофайлу')
+    parser.add_argument('--images-dir', help='Папка с изображениями для обработки вместо видео')
     parser.add_argument('--output-dir', default=None, help='Каталог вывода для результатов')
-    parser.add_argument('--no-gui', action='store_true', help='Отключить окна GUI')
+    parser.add_argument('--hide', action='store_true', help='Отключить окна GUI')
     
     args = parser.parse_args()
     
-    show_intermediate = not args.no_gui
-    main(video_path=args.video_path, show_intermediate=show_intermediate, output_dir=args.output_dir)
+    show_intermediate = not args.hide
+    if args.images_dir:
+        main(images_dir=args.images_dir, show_intermediate=show_intermediate, output_dir=args.output_dir)
+    else:
+        main(video_path=args.video_path, show_intermediate=show_intermediate, output_dir=args.output_dir)
