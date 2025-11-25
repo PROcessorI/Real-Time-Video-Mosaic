@@ -22,7 +22,7 @@ def run_main(video_path, output_dir):
         cmd = ['python', 'main.py']
         if video_path:
             cmd.append(video_path)
-        cmd.extend(['--output-dir', output_dir or '.', '--no-gui'])
+        cmd.extend(['--output-dir', output_dir or '.', '--hide'])
         print(f"Running command: {' '.join(cmd)}")  # Debug
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=os.getcwd())
         

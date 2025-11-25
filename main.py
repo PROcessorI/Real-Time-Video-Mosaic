@@ -905,11 +905,7 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
         "arial.ttf",  # PIL может найти системные шрифты по имени
         "verdana.ttf",
         "tahoma.ttf",
-        "times.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\verdana.ttf",
-        r"C:\Windows\Fonts\tahoma.ttf",
-        r"C:\Windows\Fonts\times.ttf",
+        "times.ttf"
     ]
     for p in font_paths:
         try:
