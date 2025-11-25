@@ -38,6 +38,7 @@ class VideMosaic:
 
         # Инициализировать модель YOLO для обнаружения с большей моделью для лучшей точности
         try:
+            # Использовать nano модель для быстрой работы, кастомная детекция дополняет для аэроснимков
             self.model = YOLO('yolo11n.pt')  # YOLOv11 nano модель
         except Exception as e:
             print(f"Предупреждение: не удалось загрузить модель YOLO: {e}")
@@ -114,7 +115,7 @@ class VideMosaic:
         # Оптимизированные параметры с улучшенной чувствительностью
         results = self.model.predict(
             resized,
-            conf=0.3,      # Снижен порог для обнаружения большего количества объектов
+            conf=0.15,     # Снижен порог для обнаружения машин сверху (вид с дрона)
             iou=0.4,       # Менее агрессивный NMS
             imgsz=target_size,
             verbose=False,
@@ -245,16 +246,23 @@ class VideMosaic:
                         max_r = np.max(roi_r)
                         mean_r = np.mean(roi_r)
                         mean_g = np.mean(roi_g)
+                        mean_b = np.mean(roi_b)
                         std_r = np.std(roi_r)
                         
-                        # Огонь: высокий контраст, красный доминирует, вариативность
-                        is_fire = (max_r > 160 and (max_r - mean_r) > 35 and 
-                                  mean_r > mean_g + 15 and std_r > 25)
+                        # Исключить фиолетовые объекты (крыши) - у них высокий синий
+                        is_purple = (mean_b > mean_g + 10) and (mean_r > mean_g)
                         
-                        # Или желтый огонь
+                        # Огонь: высокий контраст, красный доминирует, вариативность
+                        # Добавлено: красный должен быть больше синего (огонь не фиолетовый)
+                        is_fire = (max_r > 160 and (max_r - mean_r) > 35 and 
+                                  mean_r > mean_g + 15 and std_r > 25 and
+                                  mean_r > mean_b + 20 and not is_purple)
+                        
+                        # Или желтый огонь (у него тоже низкий синий)
                         is_yellow_fire = (mean_r > 120 and mean_g > 100 and 
-                                         mean_r > roi_b.mean() + 20 and 
-                                         abs(mean_r - mean_g) < 60)
+                                         mean_r > mean_b + 30 and 
+                                         mean_g > mean_b + 20 and
+                                         abs(mean_r - mean_g) < 60 and not is_purple)
                         
                         if is_fire or is_yellow_fire:
                             # Адаптивная уверенность
@@ -322,6 +330,111 @@ class VideMosaic:
             box2_area = (x4 - x3) * (y4 - y3)
             union_area = box1_area + box2_area - inter_area
             return inter_area / union_area if union_area > 0 else 0
+        
+        # ===== ДЕТЕКЦИЯ МАШИН С ВИДА СВЕРХУ (АЭРОСНИМКИ) =====
+        # Стандартная YOLO плохо работает на аэроснимках, поэтому добавляем
+        # детекцию по форме и цвету для машин сверху
+        car_detections = []
+        
+        # Параметры размеров машин на аэроснимках
+        # Машины на аэроснимках обычно 20-60 пикселей в длину
+        min_car_area = 250   # Минимальная площадь (отсекает мелкий шум)
+        max_car_area = 3500  # Максимальная площадь (увеличено для крупных машин)
+        
+        # Функция для поиска машин в маске определённого цвета
+        def find_cars_in_mask(color_mask, color_name):
+            cars = []
+            # Морфология для очистки
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            cleaned = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+            
+            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if min_car_area < area < max_car_area:
+                    rect = cv2.minAreaRect(cnt)
+                    (cx, cy), (w, h), angle = rect
+                    if w == 0 or h == 0:
+                        continue
+                    
+                    aspect_ratio = max(w, h) / min(w, h)
+                    rect_area = w * h
+                    rectangularity = area / rect_area if rect_area > 0 else 0
+                    
+                    # Машина: прямоугольная, умеренно вытянутая
+                    # Расширено: aspect_ratio 1.2-3.0, rectangularity снижена до 0.50
+                    if 1.2 < aspect_ratio < 3.0 and rectangularity > 0.50:
+                        x, y, bw, bh = cv2.boundingRect(cnt)
+                        
+                        # Проверить однородность цвета
+                        if y+bh <= frame.shape[0] and x+bw <= frame.shape[1]:
+                            roi = frame[y:y+bh, x:x+bw]
+                            if roi.size > 0:
+                                roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                                std_s = np.std(roi_hsv[:,:,1])
+                                std_v = np.std(roi_hsv[:,:,2])
+                                
+                                # Проверка компактности контура (машины компактные)
+                                perimeter = cv2.arcLength(cnt, True)
+                                compactness = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                                
+                                # Машина: однородный цвет И компактная форма
+                                # Компактность круга = 1, квадрата ~0.785, вытянутых < 0.5
+                                # Расширено std до 70 для учёта бликов на машинах
+                                if std_s < 70 and std_v < 70 and compactness > 0.4:
+                                    conf = min(0.85, 0.55 + rectangularity * 0.15 + compactness * 0.15)
+                                    cars.append({
+                                        'class': 'car',
+                                        'box': (x, y, x + bw, y + bh),
+                                        'confidence': conf,
+                                        'area': area,
+                                        'color': color_name
+                                    })
+            return cars
+        
+        # Белые машины - самый важный цвет для аэроснимков
+        # Повышен порог яркости (V >= 145) чтобы отсечь серый асфальт
+        # Уменьшен допуск насыщенности (S <= 50) для чистого белого
+        lower_white = np.array([0, 0, 145])
+        upper_white = np.array([180, 50, 255])
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+        car_detections.extend(find_cars_in_mask(mask_white, 'white'))
+        
+        # Чёрные/тёмные машины
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 50])
+        mask_black = cv2.inRange(hsv, lower_black, upper_black)
+        car_detections.extend(find_cars_in_mask(mask_black, 'black'))
+        
+        # Серые/серебристые машины (узкий диапазон чтобы не захватывать асфальт)
+        lower_gray = np.array([0, 0, 120])
+        upper_gray = np.array([180, 25, 170])
+        mask_gray = cv2.inRange(hsv, lower_gray, upper_gray)
+        car_detections.extend(find_cars_in_mask(mask_gray, 'gray'))
+        
+        # Бежевые/песочные машины (светлые, но с насыщенностью - важно для аэроснимков!)
+        # Покрывает машины на песчаных дорогах с H=10-30 (жёлтые тона), S до 150, V высокая
+        lower_beige = np.array([10, 30, 120])
+        upper_beige = np.array([35, 150, 255])
+        mask_beige = cv2.inRange(hsv, lower_beige, upper_beige)
+        car_detections.extend(find_cars_in_mask(mask_beige, 'beige'))
+        
+        # Красные машины
+        mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        mask_red2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        car_detections.extend(find_cars_in_mask(mask_red, 'red'))
+        
+        # Синие машины (включая светло-голубые/сине-серые)
+        # Снижен порог S с 80 до 50 для светло-голубых машин
+        mask_blue = cv2.inRange(hsv, np.array([90, 50, 100]), np.array([130, 255, 255]))
+        car_detections.extend(find_cars_in_mask(mask_blue, 'blue'))
+        
+        # Применить NMS для машин
+        for det in apply_nms(car_detections, 0.3):
+            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
         
         # Применить NMS и добавить к результатам
         for det in apply_nms(fire_detections, 0.4):
@@ -1253,7 +1366,7 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
         
     else:
         if video_path is None:
-            video_path = 'Data/поиски квадрокоптера 2 (360p) 03.mp4'
+            video_path = 'Data/поиски квадрокоптера 2 (360p) 01.mp4'
         print(f"Открытие видеофайла: {video_path}")
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
