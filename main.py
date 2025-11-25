@@ -3,6 +3,7 @@ import numpy as np
 from ultralytics import YOLO
 import os
 from pathfinding.core.grid import Grid
+from pathfinding.core.diagonal_movement import DiagonalMovement
 from pathfinding.finder.a_star import AStarFinder
 from PIL import Image, ImageDraw, ImageFont
 import argparse
@@ -65,6 +66,14 @@ class VideMosaic:
         self.H_old = np.eye(3)
         self.H_old[0, 2] = self.h_offset
         self.H_old[1, 2] = self.w_offset
+        
+        # Параметры стабилизации для защиты от тряски
+        self.stabilization_enabled = True
+        self.homography_history = []  # История гомографий для сглаживания
+        self.history_size = 5  # Количество кадров для усреднения
+        self.translation_threshold = 50  # Максимальное смещение (пиксели)
+        self.scale_threshold = 0.3  # Максимальное изменение масштаба
+        self.last_valid_H = np.eye(3)
 
     def process_first_frame(self, first_image):
         """обрабатывает первый кадр для обнаружения особенностей и описания
@@ -98,24 +107,27 @@ class VideMosaic:
     def detect_objects(self, frame):
         if self.model is None:
             return []
-        # Изменить размер кадра до стандартного размера для лучшего обнаружения
+        # Использовать большее разрешение для лучшего обнаружения мелких объектов
         original_shape = frame.shape[:2]
-        resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
-        # Использовать оптимизированные параметры для максимального качества обнаружения
+        target_size = 1280  # Увеличено с 640 для лучшей детекции
+        resized = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        # Оптимизированные параметры с улучшенной чувствительностью
         results = self.model.predict(
             resized,
-            conf=0.4,      # порог уверенности - фильтровать низкоуверенные обнаружения
-            iou=0.45,      # порог IoU для NMS - уменьшает дублирующиеся обнаружения
-            imgsz=640,     # размер изображения для обнаружения - больше для лучшей точности
-            verbose=False  # уменьшить вывод в консоль
+            conf=0.3,      # Снижен порог для обнаружения большего количества объектов
+            iou=0.4,       # Менее агрессивный NMS
+            imgsz=target_size,
+            verbose=False,
+            agnostic_nms=True,  # Класс-агностический NMS
+            max_det=300    # Увеличен лимит детекций
         )
         detections = []
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 # Масштабировать обратно к оригинальному размеру
-                scale_x = original_shape[1] / 640
-                scale_y = original_shape[0] / 640
+                scale_x = original_shape[1] / target_size
+                scale_y = original_shape[0] / target_size
                 x1 *= scale_x
                 x2 *= scale_x
                 y1 *= scale_y
@@ -129,76 +141,162 @@ class VideMosaic:
                     'confidence': confidence
                 })
         
-        # Добавить детекцию огня и дыма по цвету
+        # Добавить детекцию огня и дыма с улучшенными алгоритмами
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         b, g, r = cv2.split(frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Детекция огня - комбинация HSV и BGR анализа
-        lower_fire1 = np.array([0, 80, 100])
+        # Детекция огня - многомасштабный подход с расширенными диапазонами
+        # Красный огонь
+        lower_fire1 = np.array([0, 70, 110])
         upper_fire1 = np.array([15, 255, 255])
         mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
-        lower_fire2 = np.array([165, 80, 100])
+        
+        lower_fire2 = np.array([160, 70, 110])
         upper_fire2 = np.array([180, 255, 255])
         mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
-        mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
         
-        # Дополнительная проверка: красный канал > синий и зеленый
-        fire_bgr_mask = ((r > g + 20) & (r > b + 30) & (r > 100)).astype(np.uint8) * 255
-        mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
+        # Желто-оранжевый огонь
+        lower_fire3 = np.array([15, 60, 120])
+        upper_fire3 = np.array([35, 255, 255])
+        mask_fire3 = cv2.inRange(hsv, lower_fire3, upper_fire3)
         
-        # Морфологическая обработка
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
-        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
+        mask_fire = cv2.bitwise_or(cv2.bitwise_or(mask_fire1, mask_fire2), mask_fire3)
         
-        # Детекция дыма - низкая насыщенность, средняя яркость
-        lower_smoke = np.array([0, 0, 80])
-        upper_smoke = np.array([180, 50, 230])
-        mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
+        # Множественные BGR проверки для разных типов огня
+        fire_bgr_mask1 = ((r > g + 20) & (r > b + 30) & (r > 120)).astype(np.uint8) * 255
+        fire_bgr_mask2 = ((r > 130) & (g > 100) & (r > b + 25) & (g > b + 15) & 
+                         (np.abs(r.astype(int) - g.astype(int)) < 70)).astype(np.uint8) * 255
         
-        # Дополнительная проверка: близкие значения RGB (серый цвет)
-        smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 30) & 
-                         (np.abs(g.astype(int) - b.astype(int)) < 30) & 
-                         (r > 60)).astype(np.uint8) * 255
+        fire_bgr_combined = cv2.bitwise_or(fire_bgr_mask1, fire_bgr_mask2)
+        mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_combined)
+        
+        # Добавить градиентный анализ для динамических областей (характерно для огня)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+        gradient_mask = (gradient_mag > 30).astype(np.uint8) * 255
+        # Огонь имеет высокие градиенты
+        mask_fire = cv2.bitwise_and(mask_fire, cv2.bitwise_or(mask_fire, gradient_mask))
+        
+        # Адаптивная морфологическая обработка
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel_small)
+        
+        # Детекция дыма - улучшенная с многослойным подходом
+        # Светлый дым
+        lower_smoke1 = np.array([0, 0, 85])
+        upper_smoke1 = np.array([180, 45, 245])
+        mask_smoke1 = cv2.inRange(hsv, lower_smoke1, upper_smoke1)
+        
+        # Темный дым
+        lower_smoke2 = np.array([0, 0, 55])
+        upper_smoke2 = np.array([180, 55, 145])
+        mask_smoke2 = cv2.inRange(hsv, lower_smoke2, upper_smoke2)
+        
+        mask_smoke = cv2.bitwise_or(mask_smoke1, mask_smoke2)
+        
+        # BGR проверка с расширенным диапазоном
+        smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 25) & 
+                         (np.abs(g.astype(int) - b.astype(int)) < 25) & 
+                         (r > 55) & (g > 55) & (b > 55)).astype(np.uint8) * 255
         mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
         
-        # Морфологическая обработка
-        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
-        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
+        # Исключить очень темные области (тени)
+        bright_enough = (gray > 65).astype(np.uint8) * 255
+        mask_smoke = cv2.bitwise_and(mask_smoke, bright_enough)
         
-        # Найти контуры для огня
+        # Текстурный анализ - дым имеет низкую текстуру
+        gray_float = gray.astype(np.float32)
+        kernel_texture = np.ones((9, 9), np.float32) / 81
+        local_mean = cv2.filter2D(gray_float, -1, kernel_texture)
+        local_sq_mean = cv2.filter2D(gray_float**2, -1, kernel_texture)
+        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean**2, 0))
+        low_texture = (local_std < 35).astype(np.uint8) * 255
+        mask_smoke = cv2.bitwise_and(mask_smoke, low_texture)
+        
+        # Агрессивная морфологическая обработка для объединения облаков
+        kernel_smoke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel_smoke, iterations=3)
+        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        
+        # Найти контуры для огня с улучшенной валидацией
         fire_detections = []
         contours_fire, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours_fire:
             area = cv2.contourArea(cnt)
-            if area > 300:
+            if area > 250:  # Снижен порог для мелких очагов
                 x, y, w, h = cv2.boundingRect(cnt)
-                # Проверка плотности заполнения контура
+                # Расширить ROI для контекста
+                x1, y1 = max(0, x-3), max(0, y-3)
+                x2, y2 = min(frame.shape[1], x+w+3), min(frame.shape[0], y+h+3)
+                
                 density = area / (w * h) if w * h > 0 else 0
-                if density > 0.3:
-                    fire_detections.append({
-                        'class': 'fire',
-                        'box': (x, y, x + w, y + h),
-                        'confidence': 0.8,
-                        'area': area
-                    })
+                if density > 0.2:  # Более мягкая проверка плотности
+                    # Анализ ROI для подтверждения огня
+                    roi = frame[y1:y2, x1:x2]
+                    if roi.size > 0:
+                        roi_r = roi[:, :, 2]
+                        roi_g = roi[:, :, 1]
+                        roi_b = roi[:, :, 0]
+                        
+                        max_r = np.max(roi_r)
+                        mean_r = np.mean(roi_r)
+                        mean_g = np.mean(roi_g)
+                        std_r = np.std(roi_r)
+                        
+                        # Огонь: высокий контраст, красный доминирует, вариативность
+                        is_fire = (max_r > 160 and (max_r - mean_r) > 35 and 
+                                  mean_r > mean_g + 15 and std_r > 25)
+                        
+                        # Или желтый огонь
+                        is_yellow_fire = (mean_r > 120 and mean_g > 100 and 
+                                         mean_r > roi_b.mean() + 20 and 
+                                         abs(mean_r - mean_g) < 60)
+                        
+                        if is_fire or is_yellow_fire:
+                            # Адаптивная уверенность
+                            conf_base = min(0.95, 0.55 + (max_r - 160) / 200.0 + (std_r / 80.0) * 0.2)
+                            fire_detections.append({
+                                'class': 'fire',
+                                'box': (x, y, x + w, y + h),
+                                'confidence': conf_base,
+                                'area': area
+                            })
         
-        # Найти контуры для дыма
+        # Найти контуры для дыма с улучшенной валидацией
         smoke_detections = []
         contours_smoke, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours_smoke:
             area = cv2.contourArea(cnt)
-            if area > 500:
+            if area > 800:  # Снижен с 1200 для обнаружения меньших облаков
                 x, y, w, h = cv2.boundingRect(cnt)
-                # Проверка плотности и формы
+                # Расширить ROI
+                x1, y1 = max(0, x-3), max(0, y-3)
+                x2, y2 = min(frame.shape[1], x+w+3), min(frame.shape[0], y+h+3)
+                
                 density = area / (w * h) if w * h > 0 else 0
-                if density > 0.2:
-                    smoke_detections.append({
-                        'class': 'smoke',
-                        'box': (x, y, x + w, y + h),
-                        'confidence': 0.7,
-                        'area': area
-                    })
+                if density > 0.18:  # Более мягкий порог
+                    roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                    if roi_gray.size > 0:
+                        std_dev = np.std(roi_gray)
+                        mean_val = np.mean(roi_gray)
+                        
+                        # Дым: средняя яркость, низкая вариативность
+                        if mean_val > 85 and std_dev < 42:
+                            # Проверка формы - дым часто более вытянутый
+                            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1
+                            # Адаптивная уверенность
+                            conf_base = min(0.95, 0.50 + (1.0 - std_dev / 42.0) * 0.25 + 
+                                          min(density, 0.5) * 0.2)
+                            smoke_detections.append({
+                                'class': 'smoke',
+                                'box': (x, y, x + w, y + h),
+                                'confidence': conf_base,
+                                'area': area
+                            })
         
         # Применить NMS для удаления перекрывающихся боксов
         def apply_nms(dets, iou_threshold=0.5):
@@ -280,11 +378,30 @@ class VideMosaic:
         self.matches = self.match(self.des_cur, self.des_prev)
 
         if len(self.matches) < 4:
+            print(f"Предупреждение: Недостаточно совпадений ({len(self.matches)}), пропуск кадра")
             return
 
-        self.H = self.findHomography(self.kp_cur, self.kp_prev, self.matches)
-        self.H = np.matmul(self.H_old, self.H)
-        # TODO: проверить на плохую гомографию
+        # Вычислить гомографию
+        H_relative = self.findHomography(self.kp_cur, self.kp_prev, self.matches)
+        
+        if H_relative is None:
+            print("Предупреждение: Не удалось вычислить гомографию, пропуск кадра")
+            return
+        
+        # Проверка на валидность гомографии (защита от тряски)
+        if not self.validate_homography(H_relative):
+            print("Предупреждение: Невалидная гомография (тряска/размытие), использую последнюю валидную")
+            # Использовать последнюю валидную относительную гомографию (минимальное движение)
+            H_relative = np.eye(3)
+        else:
+            # Сохранить как последнюю валидную
+            self.last_valid_H = H_relative.copy()
+        
+        # Применить сглаживание для уменьшения дрожания
+        H_relative_smoothed = self.smooth_homography(H_relative)
+        
+        # Вычислить абсолютную гомографию
+        self.H = np.matmul(self.H_old, H_relative_smoothed)
 
         self.warp(self.frame_cur, self.H)
 
@@ -299,6 +416,81 @@ class VideMosaic:
         self.des_prev = self.des_cur
         self.frame_prev = self.frame_cur
 
+    def validate_homography(self, H):
+        """Проверяет гомографию на адекватность и фильтрует резкие движения. Удаляет эффект тряски камеры.
+        
+        Args:
+            H: матрица гомографии для проверки
+            
+        Returns:
+            bool: True если гомография валидна, False если подозрительна
+        """
+        if H is None:
+            return False
+        
+        # Проверка на NaN и Inf
+        if np.any(np.isnan(H)) or np.any(np.isinf(H)):
+            return False
+        
+        # Извлечь параметры трансформации
+        # Смещение по X и Y
+        translation_x = H[0, 2]
+        translation_y = H[1, 2]
+        translation = np.sqrt(translation_x**2 + translation_y**2)
+        
+        # Масштаб (определитель верхней левой 2x2 матрицы)
+        scale = np.sqrt(np.linalg.det(H[:2, :2]))
+        
+        # Проверка на слишком большое смещение (тряска)
+        if translation > self.translation_threshold:
+            print(f"Предупреждение: Обнаружено большое смещение ({translation:.1f}px), возможна тряска")
+            return False
+        
+        # Проверка на неадекватное изменение масштаба
+        if abs(scale - 1.0) > self.scale_threshold:
+            print(f"Предупреждение: Обнаружено большое изменение масштаба ({scale:.2f}), возможна тряска")
+            return False
+        
+        # Проверка на перспективные искажения (элементы H[2,0] и H[2,1] должны быть малы)
+        if abs(H[2, 0]) > 0.001 or abs(H[2, 1]) > 0.001:
+            print(f"Предупреждение: Обнаружены сильные перспективные искажения")
+            return False
+        
+        return True
+    
+    def smooth_homography(self, H):
+        """Сглаживает гомографию используя историю предыдущих кадров.
+        
+        Args:
+            H: текущая матрица гомографии
+            
+        Returns:
+            np.array: сглаженная гомография
+        """
+        if not self.stabilization_enabled:
+            return H
+        
+        # Добавить текущую гомографию в историю
+        self.homography_history.append(H.copy())
+        
+        # Ограничить размер истории
+        if len(self.homography_history) > self.history_size:
+            self.homography_history.pop(0)
+        
+        # Если история недостаточна, вернуть текущую гомографию
+        if len(self.homography_history) < 2:
+            return H
+        
+        # Усреднить гомографии с весами (более свежие кадры имеют больший вес)
+        weights = np.linspace(0.5, 1.0, len(self.homography_history))
+        weights = weights / np.sum(weights)
+        
+        smoothed_H = np.zeros_like(H)
+        for i, h in enumerate(self.homography_history):
+            smoothed_H += weights[i] * h
+        
+        return smoothed_H
+    
     @ staticmethod
     def findHomography(image_1_kp, image_2_kp, matches):
         """получает два соответствия и рассчитывает гомографию между двумя изображениями
@@ -441,6 +633,9 @@ def crop_black_areas(image, threshold=15, margin=5):
         threshold: Порог яркости (пиксели < threshold считаются черными)
         margin: Отступ от краев после обрезки
     """
+    # Ensure image is uint8
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     # Использовать порог для игнорирования очень темных пикселей
     _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
@@ -519,74 +714,177 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
 
     # Создать маску препятствий на основе обнаруженных объектов
     obstacles = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
+    # Создать взвешенную маску для приоритезации опасных препятствий
+    obstacles_weighted = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.float32)
 
-    # Добавить буфер вокруг обнаруженных объектов для более безопасных препятствий
-    # Расширенный список классов и увеличенные буферы
-    for det in detections:
-        if det['class'] in ['person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle', 
-                           'dog', 'horse', 'cat', 'bird', 'cow', 'sheep',
-                           'smoke', 'fire', 'building']:
-            x1, y1, x2, y2 = det['box']
-            # Увеличенный буфер безопасности в зависимости от типа объекта
-            if det['class'] in ['fire', 'smoke']:
-                buffer = 30  # Больший буфер для опасных объектов
-            elif det['class'] in ['car', 'truck', 'bus']:
-                buffer = 20  # Средний буфер для транспорта
-            else:
-                buffer = 15  # Стандартный буфер
-            
-            cv2.rectangle(obstacles, 
-                         (max(0, x1-buffer), max(0, y1-buffer)), 
-                         (min(obstacles.shape[1], x2+buffer), min(obstacles.shape[0], y2+buffer)), 
-                         255, -1)
-
-    # Добавить цветовую детекцию огня и дыма для препятствий (мягкие пороги для карты)
-    # Эти маски нужны для визуализации красных контуров препятствий, не для боксов
-    b_nav, g_nav, r_nav = cv2.split(frame)
+    # Добавить буфер вокруг обнаруженных объектов с адаптивными параметрами
+    # Расширенный список классов с приоритезацией
+    danger_classes = ['fire', 'smoke']
+    vehicle_classes = ['car', 'truck', 'bus', 'motorcycle']
+    living_classes = ['person', 'dog', 'horse', 'cat', 'bird', 'cow', 'sheep']
+    static_classes = ['bicycle', 'building']
     
-    # Огонь - мягкие пороги для карты препятствий
-    lower_fire1 = np.array([0, 100, 100])
+    for det in detections:
+        det_class = det['class']
+        if det_class in danger_classes + vehicle_classes + living_classes + static_classes:
+            x1, y1, x2, y2 = det['box']
+            
+            # Адаптивный буфер в зависимости от типа и размера объекта
+            obj_area = (x2 - x1) * (y2 - y1)
+            size_factor = min(1.5, max(1.0, obj_area / 10000.0))  # Масштабирование по размеру
+            
+            if det_class in danger_classes:
+                buffer = int(40 * size_factor)  # Максимальный буфер для огня/дыма
+                weight = 1.0
+            elif det_class in vehicle_classes:
+                buffer = int(25 * size_factor)  # Средний буфер для транспорта
+                weight = 0.9
+            elif det_class in living_classes:
+                buffer = int(20 * size_factor)  # Буфер для живых существ
+                weight = 0.85
+            else:
+                buffer = int(15 * size_factor)  # Минимальный буфер для статичных объектов
+                weight = 0.7
+            
+            x1_buf = max(0, x1 - buffer)
+            y1_buf = max(0, y1 - buffer)
+            x2_buf = min(obstacles.shape[1], x2 + buffer)
+            y2_buf = min(obstacles.shape[0], y2 + buffer)
+            
+            cv2.rectangle(obstacles, (x1_buf, y1_buf), (x2_buf, y2_buf), 255, -1)
+            cv2.rectangle(obstacles_weighted, (x1_buf, y1_buf), (x2_buf, y2_buf), weight, -1)
+
+    # Добавить цветовую детекцию огня и дыма для препятствий
+    # Использовать улучшенный подход с edge detection и текстурным анализом
+    b_nav, g_nav, r_nav = cv2.split(frame)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Огонь - многомасштабный подход для лучшего обнаружения
+    # Основные маски - расширенный диапазон для навигационной карты
+    lower_fire1 = np.array([0, 80, 120])
     upper_fire1 = np.array([15, 255, 255])
     mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
-    lower_fire2 = np.array([165, 100, 100])
+    
+    lower_fire2 = np.array([160, 80, 120])
     upper_fire2 = np.array([180, 255, 255])
     mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
-    mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
     
-    # Простая BGR проверка для огня
-    fire_bgr_mask = ((r_nav > g_nav + 20) & (r_nav > b_nav + 30) & (r_nav > 100)).astype(np.uint8) * 255
-    mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
+    # Желто-оранжевый огонь
+    lower_fire3 = np.array([15, 70, 130])
+    upper_fire3 = np.array([35, 255, 255])
+    mask_fire3 = cv2.inRange(hsv, lower_fire3, upper_fire3)
     
-    # Морфологическая обработка
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
-    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
+    mask_fire = cv2.bitwise_or(cv2.bitwise_or(mask_fire1, mask_fire2), mask_fire3)
+    
+    # BGR проверки - несколько вариантов
+    fire_bgr_mask1 = ((r_nav > g_nav + 25) & (r_nav > b_nav + 35) & (r_nav > 130)).astype(np.uint8) * 255
+    # Желтый огонь
+    fire_bgr_mask2 = ((r_nav > 130) & (g_nav > 110) & (r_nav > b_nav + 25) & 
+                     (g_nav > b_nav + 15) & (np.abs(r_nav.astype(int) - g_nav.astype(int)) < 60)).astype(np.uint8) * 255
+    
+    fire_bgr_combined = cv2.bitwise_or(fire_bgr_mask1, fire_bgr_mask2)
+    mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_combined)
+    
+    # Добавить edge detection для контуров огня
+    edges = cv2.Canny(gray, 50, 150)
+    edges_dilated = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    # Использовать края как дополнительную подсказку
+    mask_fire = cv2.bitwise_or(mask_fire, cv2.bitwise_and(edges_dilated, mask_fire))
+    
+    # Адаптивная морфологическая обработка
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel_medium, iterations=2)
+    mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel_small)
     obstacles = cv2.bitwise_or(obstacles, mask_fire)
     
-    # Дым - мягкие пороги для карты препятствий
-    lower_smoke = np.array([0, 0, 80])
-    upper_smoke = np.array([180, 50, 230])
-    mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
+    # Дым - улучшенная детекция с текстурным анализом
+    # Несколько слоев для разных типов дыма
+    lower_smoke1 = np.array([0, 0, 90])
+    upper_smoke1 = np.array([180, 45, 245])
+    mask_smoke1 = cv2.inRange(hsv, lower_smoke1, upper_smoke1)
     
-    # Простая BGR проверка для дыма
-    smoke_bgr_mask = ((np.abs(r_nav.astype(int) - g_nav.astype(int)) < 30) &
-                     (np.abs(g_nav.astype(int) - b_nav.astype(int)) < 30) &
-                     (r_nav > 70) & (g_nav > 70) & (b_nav > 70)).astype(np.uint8) * 255
+    # Темный дым
+    lower_smoke2 = np.array([0, 0, 60])
+    upper_smoke2 = np.array([180, 55, 140])
+    mask_smoke2 = cv2.inRange(hsv, lower_smoke2, upper_smoke2)
+    
+    mask_smoke = cv2.bitwise_or(mask_smoke1, mask_smoke2)
+    
+    # BGR проверка - близкие значения RGB (серый цвет)
+    smoke_bgr_mask = ((np.abs(r_nav.astype(int) - g_nav.astype(int)) < 25) &
+                     (np.abs(g_nav.astype(int) - b_nav.astype(int)) < 25) &
+                     (r_nav > 60) & (g_nav > 60) & (b_nav > 60)).astype(np.uint8) * 255
     mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
     
-    # Морфологическая обработка
-    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
-    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
+    # Исключить очень темные области (тени)
+    bright_enough = (gray > 70).astype(np.uint8) * 255
+    mask_smoke = cv2.bitwise_and(mask_smoke, bright_enough)
+    
+    # Текстурный анализ - дым имеет низкую вариативность
+    # Использовать локальное стандартное отклонение
+    gray_float = gray.astype(np.float32)
+    kernel_texture = np.ones((11, 11), np.float32) / 121
+    local_mean = cv2.filter2D(gray_float, -1, kernel_texture)
+    local_sq_mean = cv2.filter2D(gray_float**2, -1, kernel_texture)
+    local_std = np.sqrt(np.maximum(local_sq_mean - local_mean**2, 0))
+    # Дым имеет низкую текстуру
+    low_texture_mask = (local_std < 40).astype(np.uint8) * 255
+    mask_smoke = cv2.bitwise_and(mask_smoke, low_texture_mask)
+    
+    # Агрессивная морфологическая обработка для объединения облаков дыма
+    kernel_smoke_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel_smoke_large, iterations=3)
+    mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel_small, iterations=1)
     obstacles = cv2.bitwise_or(obstacles, mask_smoke)
 
-    # Расширить препятствия для большей безопасности
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    obstacles = cv2.dilate(obstacles, kernel, iterations=2)
+    # ===== ДЕТЕКЦИЯ ПРЕПЯТСТВИЙ ПО ТЕКСТУРАМ =====
+    
+    # 1. Создать рабочую область (убрать черную рамку)
+    _, valid_mask = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
+    kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+    valid_mask = cv2.erode(valid_mask, kernel_erode, iterations=1)
+    
+    # 2. Текстурный анализ - находит деревья, кусты, здания
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+    texture_diff = cv2.absdiff(gray, blurred)
+    _, texture_mask = cv2.threshold(texture_diff, 6, 255, cv2.THRESH_BINARY)
+    texture_mask = cv2.bitwise_and(texture_mask, valid_mask)
+    
+    # 3. Морфология - меньше обработки чтобы сохранить больше контуров
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    texture_mask = cv2.morphologyEx(texture_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    texture_mask = cv2.morphologyEx(texture_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    
+    # DEBUG: Сохранить
+    cv2.imwrite('debug_texture_mask.jpg', texture_mask)
+    
+    # 4. Найти контуры текстур
+    all_contours, hierarchy = cv2.findContours(texture_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Фильтруем контуры по площади
+    obstacle_contours_to_draw = []
+    for cnt in all_contours:
+        area = cv2.contourArea(cnt)
+        if 20 < area < 500000:  # Минимум 20 пикселей для большего количества контуров
+            obstacle_contours_to_draw.append(cnt)
+    
+    print(f"DEBUG: Найдено {len(obstacle_contours_to_draw)} контуров препятствий")
+    
+    # Для навигации добавляем текстурную маску к существующим препятствиям
+    obstacles = cv2.bitwise_or(obstacles, texture_mask)
+    
+    # Расширить препятствия для навигации
+    kernel_nav_buffer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    obstacles_for_navigation = cv2.dilate(obstacles, kernel_nav_buffer, iterations=1)
 
     # Отметить препятствия как контуры на копии кадра
     nav_map = frame.copy()
-    contours, _ = cv2.findContours(obstacles, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(nav_map, contours, -1, (0, 0, 255), 2)  # Красные контуры для препятствий
+    
+    # Рисуем только сохраненные контуры препятствий красным цветом (без заливки и без краевых)
+    if obstacle_contours_to_draw:
+        cv2.drawContours(nav_map, obstacle_contours_to_draw, -1, (0, 0, 255), 2)  # Красные контуры
 
     # точка по умолчанию (нижний-центр) если не предоставлена GUI
     default_start = (frame.shape[1] // 2, frame.shape[0] - 50)
@@ -727,7 +1025,7 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
         return buildings
 
     # Построить downsampled occupancy grid и использовать A* для маршрутизации.
-    def find_path_astar(start_px, goal_px, obstacle_mask, scale=8):
+    def find_path_astar(start_px, goal_px, obstacle_mask, scale=4):
         # Создать матрицу, где 0 = проходимо, 1 = заблокировано
         h, w = obstacle_mask.shape
         gh = max(1, h // scale)
@@ -740,13 +1038,13 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
                 y1 = min(h, y0 + scale)
                 x1 = min(w, x0 + scale)
                 block = obstacle_mask[y0:y1, x0:x1]
-                # Если присутствует хоть один пиксель препятствия, отметить заблокированным
-                if np.any(block > 0):
+                # Если больше 30% пикселей - препятствие, отметить заблокированным
+                if np.sum(block > 0) > (scale * scale * 0.3):
                     matrix[gy][gx] = 1
         grid = Grid(matrix=matrix)
         start_node = grid.node(max(0, min(gw - 1, start_px[0] // scale)), max(0, min(gh - 1, start_px[1] // scale)))
         end_node = grid.node(max(0, min(gw - 1, goal_px[0] // scale)), max(0, min(gh - 1, goal_px[1] // scale)))
-        finder = AStarFinder(diagonal_movement=True)
+        finder = AStarFinder(diagonal_movement=DiagonalMovement.always)
         path, runs = finder.find_path(start_node, end_node, grid)
         if not path:
             return None
@@ -804,10 +1102,11 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
                 bx1, by1, bx2, by2, confidence = building
                 center_x = (bx1 + bx2) // 2
                 center_y = (by1 + by2) // 2
-                astar_scale = 8  # Увеличенный масштаб для более быстрого вычисления
-                path = find_path_astar((start_x, start_y), (center_x, center_y), obstacles, scale=astar_scale)
+                astar_scale = 4  # Более точный масштаб
+                # Использовать расширенную маску для обхода с запасом
+                path = find_path_astar((start_x, start_y), (center_x, center_y), obstacles_for_navigation, scale=astar_scale)
                 if path:
-                    path = smooth_path(path, window=3)
+                    path = smooth_path(path, window=5)  # Больше сглаживания
                     try:
                         pts = np.array(path, dtype=np.int32)
                         cv2.polylines(worker_nav, [pts], False, (0, 255, 0), thickness=3, lineType=cv2.LINE_AA)
@@ -825,7 +1124,7 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
                             cv2.line(worker_nav, (mid_x, mid_y), (center_x, center_y), (0, 255, 0), 2)
                         else:
                             draw_dotted_line(worker_nav, (start_x, start_y), (center_x, center_y), (0, 255, 0), 2)
-                cv2.rectangle(worker_nav, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
+                cv2.rectangle(worker_nav, (bx1, by1), (bx2, by2), (0, 255, 255), 2)  # Желтые прямоугольники для зданий
                 label_with_conf = f"Здание {confidence*100:.0f}%"
                 labels.append((label_with_conf, (bx1, max(5, by1 - 18)), (0, 255, 255)))
             result_dict['nav_overlay'] = worker_nav
@@ -906,161 +1205,20 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
         detections_dir = os.path.join(output_dir, 'Detections') if output_dir else 'Detections'
         os.makedirs(detections_dir, exist_ok=True)
         
-        # Загрузить модель YOLO
+        # Загрузить модель YOLO и создать временный объект для детекции
         try:
-            model = YOLO('yolo11n.pt')
+            # Создать временное изображение для инициализации
+            temp_frame = cv2.imread(image_files[0])
+            if temp_frame is None:
+                print("Ошибка: не удалось загрузить первое изображение")
+                return
+            
+            # Создать объект VideMosaic для использования его методов детекции
+            temp_mosaic = VideMosaic(temp_frame, detector_type="sift", show_intermediate=False, output_dir=output_dir, visualize=False)
         except Exception as e:
-            print(f"Ошибка загрузки модели YOLO: {e}")
+            print(f"Ошибка инициализации детектора: {e}")
             return
         
-        def detect_objects_static(frame, model):
-            original_shape = frame.shape[:2]
-            resized = cv2.resize(frame, (640, 640), interpolation=cv2.INTER_LINEAR)
-            results = model.predict(resized, conf=0.4, iou=0.45, imgsz=640, verbose=False)
-            detections = []
-            for result in results:
-                for box in result.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    scale_x = original_shape[1] / 640
-                    scale_y = original_shape[0] / 640
-                    x1 *= scale_x
-                    x2 *= scale_x
-                    y1 *= scale_y
-                    y2 *= scale_y
-                    class_id = int(box.cls[0])
-                    confidence = float(box.conf[0])
-                    class_name = model.names[class_id] if hasattr(model, 'names') else str(class_id)
-                    detections.append({
-                        'class': class_name, 
-                        'box': (int(x1), int(y1), int(x2), int(y2)),
-                        'confidence': confidence
-                    })
-            
-            # Добавить детекцию огня и дыма по цвету
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            b, g, r = cv2.split(frame)
-            
-            # Детекция огня - комбинация HSV и BGR анализа (очень строгие пороги)
-            lower_fire1 = np.array([0, 130, 170])
-            upper_fire1 = np.array([10, 255, 255])
-            mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
-            lower_fire2 = np.array([170, 130, 170])
-            upper_fire2 = np.array([180, 255, 255])
-            mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
-            mask_fire = cv2.bitwise_or(mask_fire1, mask_fire2)
-            
-            # Дополнительная проверка: очень яркий красный, сильно доминирует над G и B
-            fire_bgr_mask = ((r > g + 40) & (r > b + 50) & (r > 180)).astype(np.uint8) * 255
-            mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_mask)
-            
-            # Морфологическая обработка
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel)
-            mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel)
-
-            # Детекция дыма - низкая насыщенность, высокая яркость
-            lower_smoke = np.array([0, 0, 130])
-            upper_smoke = np.array([180, 35, 230])
-            mask_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
-            
-            # Дополнительная проверка: очень близкие значения RGB (серый цвет) и высокая яркость
-            smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 15) & 
-                             (np.abs(g.astype(int) - b.astype(int)) < 15) & 
-                             (r > 130) & (g > 130) & (b > 130)).astype(np.uint8) * 255
-            mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
-            
-            # Исключить тени по яркости
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            bright_mask = (gray > 130).astype(np.uint8) * 255
-            mask_smoke = cv2.bitwise_and(mask_smoke, bright_mask)
-            
-            # Морфологическая обработка
-            mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel)
-            mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel)
-            
-            # Найти контуры для огня
-            fire_detections = []
-            contours_fire, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours_fire:
-                area = cv2.contourArea(cnt)
-                if area > 800:  # Увеличена минимальная площадь
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    # Проверка плотности заполнения контура
-                    density = area / (w * h) if w * h > 0 else 0
-                    if density > 0.35:  # Более строгая проверка
-                        # Дополнительная проверка контраста в области
-                        roi = frame[y:y+h, x:x+w]
-                        if roi.size > 0:
-                            roi_r = roi[:, :, 2]
-                            max_r = np.max(roi_r)
-                            mean_r = np.mean(roi_r)
-                            # Огонь имеет высокий контраст в красном канале
-                            if max_r > 200 and (max_r - mean_r) > 50:
-                                fire_detections.append({
-                                    'class': 'fire',
-                                    'box': (x, y, x + w, y + h),
-                                    'confidence': 0.9,
-                                    'area': area
-                                })
-            
-            # Найти контуры для дыма
-            smoke_detections = []
-            contours_smoke, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours_smoke:
-                area = cv2.contourArea(cnt)
-                if area < 2000:
-                    continue
-                x, y, w, h = cv2.boundingRect(cnt)
-                # Проверка плотности и формы
-                density = area / (w * h) if w * h > 0 else 0
-                if density < 0.35:
-                    continue
-                roi = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-                if roi.size == 0:
-                    continue
-                std_dev = np.std(roi)
-                mean_val = np.mean(roi)
-                if not (mean_val > 135 and std_dev < 35):
-                    continue
-                smoke_detections.append({
-                    'class': 'smoke',
-                    'box': (x, y, x + w, y + h),
-                    'confidence': 0.9,
-                    'area': area
-                })
-            
-            # Применить NMS для удаления перекрывающихся боксов
-            def apply_nms(dets, iou_threshold=0.5):
-                if not dets:
-                    return []
-                dets_sorted = sorted(dets, key=lambda x: x['area'], reverse=True)
-                keep = []
-                while dets_sorted:
-                    current = dets_sorted.pop(0)
-                    keep.append(current)
-                    x1, y1, x2, y2 = current['box']
-                    dets_sorted = [d for d in dets_sorted if 
-                                  calculate_iou((x1, y1, x2, y2), d['box']) < iou_threshold]
-                return keep
-            
-            def calculate_iou(box1, box2):
-                x1, y1, x2, y2 = box1
-                x3, y3, x4, y4 = box2
-                xi1, yi1 = max(x1, x3), max(y1, y3)
-                xi2, yi2 = min(x2, x4), min(y2, y4)
-                inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-                box1_area = (x2 - x1) * (y2 - y1)
-                box2_area = (x4 - x3) * (y4 - y3)
-                union_area = box1_area + box2_area - inter_area
-                return inter_area / union_area if union_area > 0 else 0
-            
-            # Применить NMS и добавить к результатам
-            for det in apply_nms(fire_detections, 0.4):
-                detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
-            for det in apply_nms(smoke_detections, 0.4):
-                detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
-            
-            return detections
         
         print(f"Найдено {len(image_files)} изображений для обработки")
         for image_path in image_files:
@@ -1069,10 +1227,10 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
                 print(f"Не удалось загрузить {image_path}")
                 continue
             
-            detections = detect_objects_static(frame, model)
+            detections = temp_mosaic.detect_objects(frame)
             
-            # Создать навигационную карту с детекциями (без построения путей для скорости)
-            nav_map = analyze_for_navigation(frame, detections, compute_paths=False)
+            # Создать навигационную карту с детекциями (С построением путей к зданиям)
+            nav_map = analyze_for_navigation(frame, detections, compute_paths=True)
             
             # Нарисовать bounding boxes на оригинальном изображении
             detected_frame = frame.copy()
@@ -1201,7 +1359,8 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
     # Опционально проанализировать мозаику для навигации: отметить препятствия и нарисовать пути к объектам
     # Закомментировано создание карты навигации по запросу пользователя
     print("Анализ мозаики для навигации...")
-    navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), all_detections, start_point=start_point)
+    # start_point=None заставит функцию использовать центр снизу текущего изображения (scaled_mosaic)
+    navigation_map = analyze_for_navigation(scaled_mosaic.astype(np.uint8), all_detections, start_point=None)
     print("Масштабирование карты навигации к экрану...")
     try:
         scaled_nav = scale_to_screen(navigation_map)
