@@ -10,9 +10,11 @@ import argparse
 import sys
 
 
+import gc  # Для сборки мусора
+
 class VideMosaic:
     # def __init__(self, first_image, output_height_times=2, output_width_times=4, detector_type="sift"):
-    def __init__(self, first_image, output_height_times=3, output_width_times=1.2, detector_type="sift", show_intermediate=True, output_dir=None, visualize=True):
+    def __init__(self, first_image, output_height_times=2, output_width_times=1.2, detector_type="sift", show_intermediate=True, output_dir=None, visualize=True):
         """Этот класс обрабатывает каждый кадр и генерирует панораму.
 
         Args:
@@ -43,6 +45,30 @@ class VideMosaic:
         except Exception as e:
             print(f"Предупреждение: не удалось загрузить модель YOLO: {e}")
             self.model = None
+        
+        # Инициализировать YOLO-World для детекции машин с вида сверху (аэроснимки)
+        try:
+            self.model_world = YOLO('yolov8x-worldv2.pt')
+            # Устанавливаем все классы для детекции
+            self.detection_classes = [
+                # Транспорт
+                'car', 'vehicle', 'automobile', 'van', 'truck', 'bus', 'motorcycle', 'bicycle',
+                # Люди
+                'person', 'people', 'human', 'pedestrian',
+                # Опасности
+                'fire', 'flame', 'smoke', 'explosion',
+                # Животные
+                'dog', 'cat', 'bird', 'animal',
+                # Строения
+                'building', 'house', 'roof', 'structure',
+                # Прочее
+                'boat', 'ship', 'airplane', 'helicopter', 'drone'
+            ]
+            self.model_world.set_classes(self.detection_classes)
+            print("YOLO-World модель загружена для универсальной детекции объектов")
+        except Exception as e:
+            print(f"Предупреждение: не удалось загрузить YOLO-World: {e}")
+            self.model_world = None
 
         # Инициализировать окно OpenCV для промежуточной визуализации, если включено
         # if self.show_intermediate:
@@ -105,342 +131,378 @@ class VideMosaic:
                 boxes.append((int(x1), int(y1), int(x2), int(y2)))
         return boxes
 
+    def _enhance_for_detection(self, frame):
+        """Улучшает контраст изображения для лучшей детекции белых объектов на светлом фоне."""
+        # Конвертируем в LAB для работы с яркостью
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # CLAHE для улучшения контраста
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        
+        # Собираем обратно
+        lab = cv2.merge([l, a, b])
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        return enhanced
+
     def detect_objects(self, frame):
+        """Универсальная детекция объектов с помощью YOLO-World.
+        
+        YOLO-World может детектировать любые объекты по текстовому описанию,
+        что идеально подходит для аэроснимков и нестандартных ракурсов.
+        
+        Args:
+            frame: входное изображение (BGR)
+            
+        Returns:
+            list: список детекций в формате {'class': str, 'box': tuple, 'confidence': float}
+        """
+        detections = []
+        
+        # Используем YOLO-World как основной детектор
+        if hasattr(self, 'model_world') and self.model_world is not None:
+            try:
+                # Улучшаем контраст для лучшей детекции
+                enhanced_frame = self._enhance_for_detection(frame)
+                
+                # Детекция на улучшенном изображении
+                results = self.model_world.predict(
+                    enhanced_frame,
+                    conf=0.01,      # Очень низкий порог для полноты детекции
+                    imgsz=1280,     # Высокое разрешение
+                    verbose=False,
+                    augment=True,   # Аугментация для лучшей детекции
+                    iou=0.3
+                )
+                
+                for r in results:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        class_name = self.model_world.names[cls_id]
+                        
+                        # Нормализуем названия классов
+                        normalized_class = self._normalize_class_name(class_name)
+                        
+                        detections.append({
+                            'class': normalized_class,
+                            'box': (x1, y1, x2, y2),
+                            'confidence': conf
+                        })
+                
+                # Второй проход на оригинальном изображении для белых объектов
+                results2 = self.model_world.predict(
+                    frame,  # Оригинал без улучшения
+                    conf=0.01,
+                    imgsz=1280,
+                    verbose=False,
+                    iou=0.3
+                )
+                
+                for r in results2:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        class_name = self.model_world.names[cls_id]
+                        normalized_class = self._normalize_class_name(class_name)
+                        
+                        # Проверяем, нет ли уже такой детекции
+                        is_dup = False
+                        for d in detections:
+                            dx1, dy1, dx2, dy2 = d['box']
+                            # Если центры близко - дубликат
+                            c1 = ((x1+x2)/2, (y1+y2)/2)
+                            c2 = ((dx1+dx2)/2, (dy1+dy2)/2)
+                            dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
+                            if dist < 30:
+                                is_dup = True
+                                break
+                        
+                        if not is_dup:
+                            detections.append({
+                                'class': normalized_class,
+                                'box': (x1, y1, x2, y2),
+                                'confidence': conf
+                            })
+                        
+            except Exception as e:
+                print(f"YOLO-World ошибка: {e}")
+                # Fallback на стандартную YOLO если YOLO-World не работает
+                detections = self._detect_with_standard_yolo(frame)
+        else:
+            # Fallback на стандартную YOLO
+            detections = self._detect_with_standard_yolo(frame)
+        
+        # Фильтруем слишком большие детекции (убираем огромные прямоугольники)
+        frame_area = frame.shape[0] * frame.shape[1]
+        max_det_area = frame_area * 0.15  # Макс 15% кадра
+        filtered_detections = []
+        for d in detections:
+            w = d['box'][2] - d['box'][0]
+            h = d['box'][3] - d['box'][1]
+            area = w * h
+            # Убираем слишком большие (>15% кадра) и слишком маленькие (<50 пикс)
+            if 50 < area < max_det_area:
+                filtered_detections.append(d)
+        detections = filtered_detections
+        
+        # CV2 детекция зданий - для аэроснимков
+        cv2_buildings = self._detect_buildings_cv2(frame)
+        print(f"CV2 детектировал {len(cv2_buildings)} потенциальных зданий")
+        
+        # Добавляем только те, которые не перекрываются с существующими детекциями
+        for cv2_det in cv2_buildings:
+            is_duplicate = False
+            for existing in detections:
+                # Проверяем перекрытие со всеми детекциями (не только зданиями)
+                x1, y1, x2, y2 = cv2_det['box']
+                ex1, ey1, ex2, ey2 = existing['box']
+                
+                # Вычисляем пересечение
+                ix1 = max(x1, ex1)
+                iy1 = max(y1, ey1)
+                ix2 = min(x2, ex2)
+                iy2 = min(y2, ey2)
+                
+                if ix2 > ix1 and iy2 > iy1:
+                    inter_area = (ix2 - ix1) * (iy2 - iy1)
+                    area1 = (x2 - x1) * (y2 - y1)
+                    area2 = (ex2 - ex1) * (ey2 - ey1)
+                    iou = inter_area / (area1 + area2 - inter_area) if (area1 + area2 - inter_area) > 0 else 0
+                    if iou > 0.3:
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                detections.append(cv2_det)
+        
+        # CV2 детекция машин (светлые прямоугольные объекты)
+        cv2_vehicles = self._detect_vehicles_cv2(frame)
+        print(f"CV2 детектировал {len(cv2_vehicles)} потенциальных машин")
+        
+        for cv2_det in cv2_vehicles:
+            is_duplicate = False
+            for existing in detections:
+                x1, y1, x2, y2 = cv2_det['box']
+                ex1, ey1, ex2, ey2 = existing['box']
+                
+                # Проверяем перекрытие центров
+                c1 = ((x1+x2)/2, (y1+y2)/2)
+                c2 = ((ex1+ex2)/2, (ey1+ey2)/2)
+                dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
+                if dist < 25:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                detections.append(cv2_det)
+        
+        return detections
+    
+    def _normalize_class_name(self, class_name):
+        """Нормализует название класса к стандартному виду."""
+        # Транспорт -> car
+        if class_name in ['car', 'vehicle', 'automobile', 'van']:
+            return 'car'
+        elif class_name in ['truck']:
+            return 'truck'
+        elif class_name in ['bus']:
+            return 'bus'
+        elif class_name in ['motorcycle']:
+            return 'motorcycle'
+        elif class_name in ['bicycle']:
+            return 'bicycle'
+        # Люди -> person
+        elif class_name in ['person', 'people', 'human', 'pedestrian']:
+            return 'person'
+        # Опасности
+        elif class_name in ['fire', 'flame']:
+            return 'fire'
+        elif class_name in ['smoke']:
+            return 'smoke'
+        elif class_name in ['explosion']:
+            return 'explosion'
+        # Животные
+        elif class_name in ['dog']:
+            return 'dog'
+        elif class_name in ['cat']:
+            return 'cat'
+        elif class_name in ['bird']:
+            return 'bird'
+        elif class_name in ['animal']:
+            return 'animal'
+        # Строения
+        elif class_name in ['building', 'house', 'roof', 'structure']:
+            return 'building'
+        # Воздушный/водный транспорт
+        elif class_name in ['boat', 'ship']:
+            return 'boat'
+        elif class_name in ['airplane']:
+            return 'airplane'
+        elif class_name in ['helicopter']:
+            return 'helicopter'
+        elif class_name in ['drone']:
+            return 'drone'
+        else:
+            return class_name
+    
+    def _detect_with_standard_yolo(self, frame):
+        """Fallback детекция со стандартной YOLO моделью."""
         if self.model is None:
             return []
-        # Использовать большее разрешение для лучшего обнаружения мелких объектов
-        original_shape = frame.shape[:2]
-        target_size = 1280  # Увеличено с 640 для лучшей детекции
-        resized = cv2.resize(frame, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
-        # Оптимизированные параметры с улучшенной чувствительностью
-        results = self.model.predict(
-            resized,
-            conf=0.15,     # Снижен порог для обнаружения машин сверху (вид с дрона)
-            iou=0.4,       # Менее агрессивный NMS
-            imgsz=target_size,
-            verbose=False,
-            agnostic_nms=True,  # Класс-агностический NMS
-            max_det=300    # Увеличен лимит детекций
-        )
+            
         detections = []
+        results = self.model.predict(
+            frame,
+            conf=0.25,
+            imgsz=640,
+            verbose=False
+        )
+        
         for result in results:
             for box in result.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Масштабировать обратно к оригинальному размеру
-                scale_x = original_shape[1] / target_size
-                scale_y = original_shape[0] / target_size
-                x1 *= scale_x
-                x2 *= scale_x
-                y1 *= scale_y
-                y2 *= scale_y
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                 class_id = int(box.cls[0])
-                confidence = float(box.conf[0])  # Получить оценку уверенности
+                confidence = float(box.conf[0])
                 class_name = self.model.names[class_id] if hasattr(self.model, 'names') else str(class_id)
                 detections.append({
-                    'class': class_name, 
-                    'box': (int(x1), int(y1), int(x2), int(y2)),
+                    'class': class_name,
+                    'box': (x1, y1, x2, y2),
                     'confidence': confidence
                 })
         
-        # Добавить детекцию огня и дыма с улучшенными алгоритмами
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        b, g, r = cv2.split(frame)
+        return detections
+
+    def _detect_buildings_cv2(self, frame):
+        """Детекция зданий: поиск светлых прямоугольных областей (крыши).
+        
+        На аэроснимках крыши зданий выглядят как светлые однородные 
+        прямоугольные области на ЧБ изображении.
+        """
+        detections = []
+        
+        # Переводим в ЧБ
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Детекция огня - многомасштабный подход с расширенными диапазонами
-        # Красный огонь
-        lower_fire1 = np.array([0, 70, 110])
-        upper_fire1 = np.array([15, 255, 255])
-        mask_fire1 = cv2.inRange(hsv, lower_fire1, upper_fire1)
+        # Убираем чёрные границы мозаики  
+        _, valid_mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
         
-        lower_fire2 = np.array([160, 70, 110])
-        upper_fire2 = np.array([180, 255, 255])
-        mask_fire2 = cv2.inRange(hsv, lower_fire2, upper_fire2)
+        # CLAHE для улучшения контраста
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
         
-        # Желто-оранжевый огонь
-        lower_fire3 = np.array([15, 60, 120])
-        upper_fire3 = np.array([35, 255, 255])
-        mask_fire3 = cv2.inRange(hsv, lower_fire3, upper_fire3)
+        # Размытие для уменьшения шума и текстуры
+        blurred = cv2.GaussianBlur(gray_eq, (7, 7), 0)
         
-        mask_fire = cv2.bitwise_or(cv2.bitwise_or(mask_fire1, mask_fire2), mask_fire3)
+        # Находим СВЕТЛЫЕ области (крыши светлее окружения)
+        # Адаптивный порог - инвертированный (светлое = белое)
+        adaptive = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, -5  # Отрицательный C = светлые области
+        )
         
-        # Множественные BGR проверки для разных типов огня
-        fire_bgr_mask1 = ((r > g + 20) & (r > b + 30) & (r > 120)).astype(np.uint8) * 255
-        fire_bgr_mask2 = ((r > 130) & (g > 100) & (r > b + 25) & (g > b + 15) & 
-                         (np.abs(r.astype(int) - g.astype(int)) < 70)).astype(np.uint8) * 255
+        # Также порог по яркости
+        _, bright = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY)
         
-        fire_bgr_combined = cv2.bitwise_or(fire_bgr_mask1, fire_bgr_mask2)
-        mask_fire = cv2.bitwise_and(mask_fire, fire_bgr_combined)
+        # Комбинируем
+        combined = cv2.bitwise_and(adaptive, bright)
+        combined = cv2.bitwise_and(combined, valid_mask)
         
-        # Добавить градиентный анализ для динамических областей (характерно для огня)
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
-        gradient_mask = (gradient_mag > 30).astype(np.uint8) * 255
-        # Огонь имеет высокие градиенты
-        mask_fire = cv2.bitwise_and(mask_fire, cv2.bitwise_or(mask_fire, gradient_mask))
+        cv2.imwrite('debug_bright_areas.jpg', combined)
         
-        # Адаптивная морфологическая обработка
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_CLOSE, kernel_large, iterations=2)
-        mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_OPEN, kernel_small)
+        # Морфология - закрываем дыры внутри зданий, убираем мелкий шум
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel_open, iterations=2)
         
-        # Детекция дыма - улучшенная с многослойным подходом
-        # Светлый дым
-        lower_smoke1 = np.array([0, 0, 85])
-        upper_smoke1 = np.array([180, 45, 245])
-        mask_smoke1 = cv2.inRange(hsv, lower_smoke1, upper_smoke1)
+        cv2.imwrite('debug_buildings_mask.jpg', combined)
         
-        # Темный дым
-        lower_smoke2 = np.array([0, 0, 55])
-        upper_smoke2 = np.array([180, 55, 145])
-        mask_smoke2 = cv2.inRange(hsv, lower_smoke2, upper_smoke2)
+        # Находим контуры
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        mask_smoke = cv2.bitwise_or(mask_smoke1, mask_smoke2)
+        # Максимальная площадь = 10% от кадра для зданий
+        frame_area = frame.shape[0] * frame.shape[1]
+        max_building_area = frame_area * 0.10
         
-        # BGR проверка с расширенным диапазоном
-        smoke_bgr_mask = ((np.abs(r.astype(int) - g.astype(int)) < 25) & 
-                         (np.abs(g.astype(int) - b.astype(int)) < 25) & 
-                         (r > 55) & (g > 55) & (b > 55)).astype(np.uint8) * 255
-        mask_smoke = cv2.bitwise_and(mask_smoke, smoke_bgr_mask)
-        
-        # Исключить очень темные области (тени)
-        bright_enough = (gray > 65).astype(np.uint8) * 255
-        mask_smoke = cv2.bitwise_and(mask_smoke, bright_enough)
-        
-        # Текстурный анализ - дым имеет низкую текстуру
-        gray_float = gray.astype(np.float32)
-        kernel_texture = np.ones((9, 9), np.float32) / 81
-        local_mean = cv2.filter2D(gray_float, -1, kernel_texture)
-        local_sq_mean = cv2.filter2D(gray_float**2, -1, kernel_texture)
-        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean**2, 0))
-        low_texture = (local_std < 35).astype(np.uint8) * 255
-        mask_smoke = cv2.bitwise_and(mask_smoke, low_texture)
-        
-        # Агрессивная морфологическая обработка для объединения облаков
-        kernel_smoke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_CLOSE, kernel_smoke, iterations=3)
-        mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_OPEN, kernel_small, iterations=1)
-        
-        # Найти контуры для огня с улучшенной валидацией
-        fire_detections = []
-        contours_fire, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours_fire:
+        for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 250:  # Снижен порог для мелких очагов
-                x, y, w, h = cv2.boundingRect(cnt)
-                # Расширить ROI для контекста
-                x1, y1 = max(0, x-3), max(0, y-3)
-                x2, y2 = min(frame.shape[1], x+w+3), min(frame.shape[0], y+h+3)
-                
-                density = area / (w * h) if w * h > 0 else 0
-                if density > 0.2:  # Более мягкая проверка плотности
-                    # Анализ ROI для подтверждения огня
-                    roi = frame[y1:y2, x1:x2]
-                    if roi.size > 0:
-                        roi_r = roi[:, :, 2]
-                        roi_g = roi[:, :, 1]
-                        roi_b = roi[:, :, 0]
-                        
-                        max_r = np.max(roi_r)
-                        mean_r = np.mean(roi_r)
-                        mean_g = np.mean(roi_g)
-                        mean_b = np.mean(roi_b)
-                        std_r = np.std(roi_r)
-                        
-                        # Исключить фиолетовые объекты (крыши) - у них высокий синий
-                        is_purple = (mean_b > mean_g + 10) and (mean_r > mean_g)
-                        
-                        # Огонь: высокий контраст, красный доминирует, вариативность
-                        # Добавлено: красный должен быть больше синего (огонь не фиолетовый)
-                        is_fire = (max_r > 160 and (max_r - mean_r) > 35 and 
-                                  mean_r > mean_g + 15 and std_r > 25 and
-                                  mean_r > mean_b + 20 and not is_purple)
-                        
-                        # Или желтый огонь (у него тоже низкий синий)
-                        is_yellow_fire = (mean_r > 120 and mean_g > 100 and 
-                                         mean_r > mean_b + 30 and 
-                                         mean_g > mean_b + 20 and
-                                         abs(mean_r - mean_g) < 60 and not is_purple)
-                        
-                        if is_fire or is_yellow_fire:
-                            # Адаптивная уверенность
-                            conf_base = min(0.95, 0.55 + (max_r - 160) / 200.0 + (std_r / 80.0) * 0.2)
-                            fire_detections.append({
-                                'class': 'fire',
-                                'box': (x, y, x + w, y + h),
-                                'confidence': conf_base,
-                                'area': area
-                            })
-        
-        # Найти контуры для дыма с улучшенной валидацией
-        smoke_detections = []
-        contours_smoke, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours_smoke:
-            area = cv2.contourArea(cnt)
-            if area > 800:  # Снижен с 1200 для обнаружения меньших облаков
-                x, y, w, h = cv2.boundingRect(cnt)
-                # Расширить ROI
-                x1, y1 = max(0, x-3), max(0, y-3)
-                x2, y2 = min(frame.shape[1], x+w+3), min(frame.shape[0], y+h+3)
-                
-                density = area / (w * h) if w * h > 0 else 0
-                if density > 0.18:  # Более мягкий порог
-                    roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                    if roi_gray.size > 0:
-                        std_dev = np.std(roi_gray)
-                        mean_val = np.mean(roi_gray)
-                        
-                        # Дым: средняя яркость, низкая вариативность
-                        if mean_val > 85 and std_dev < 42:
-                            # Проверка формы - дым часто более вытянутый
-                            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1
-                            # Адаптивная уверенность
-                            conf_base = min(0.95, 0.50 + (1.0 - std_dev / 42.0) * 0.25 + 
-                                          min(density, 0.5) * 0.2)
-                            smoke_detections.append({
-                                'class': 'smoke',
-                                'box': (x, y, x + w, y + h),
-                                'confidence': conf_base,
-                                'area': area
-                            })
-        
-        # Применить NMS для удаления перекрывающихся боксов
-        def apply_nms(dets, iou_threshold=0.5):
-            if not dets:
-                return []
-            dets_sorted = sorted(dets, key=lambda x: x['area'], reverse=True)
-            keep = []
-            while dets_sorted:
-                current = dets_sorted.pop(0)
-                keep.append(current)
-                x1, y1, x2, y2 = current['box']
-                dets_sorted = [d for d in dets_sorted if 
-                              calculate_iou((x1, y1, x2, y2), d['box']) < iou_threshold]
-            return keep
-        
-        def calculate_iou(box1, box2):
-            x1, y1, x2, y2 = box1
-            x3, y3, x4, y4 = box2
-            xi1, yi1 = max(x1, x3), max(y1, y3)
-            xi2, yi2 = min(x2, x4), min(y2, y4)
-            inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-            box1_area = (x2 - x1) * (y2 - y1)
-            box2_area = (x4 - x3) * (y4 - y3)
-            union_area = box1_area + box2_area - inter_area
-            return inter_area / union_area if union_area > 0 else 0
-        
-        # ===== ДЕТЕКЦИЯ МАШИН С ВИДА СВЕРХУ (АЭРОСНИМКИ) =====
-        # Стандартная YOLO плохо работает на аэроснимках, поэтому добавляем
-        # детекцию по форме и цвету для машин сверху
-        car_detections = []
-        
-        # Параметры размеров машин на аэроснимках
-        # Машины на аэроснимках обычно 20-60 пикселей в длину
-        min_car_area = 250   # Минимальная площадь (отсекает мелкий шум)
-        max_car_area = 3500  # Максимальная площадь (увеличено для крупных машин)
-        
-        # Функция для поиска машин в маске определённого цвета
-        def find_cars_in_mask(color_mask, color_name):
-            cars = []
-            # Морфология для очистки
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            cleaned = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
             
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if min_car_area < area < max_car_area:
-                    rect = cv2.minAreaRect(cnt)
-                    (cx, cy), (w, h), angle = rect
-                    if w == 0 or h == 0:
-                        continue
+            # Фильтр по размеру - здания могут быть большими
+            if 800 < area < max_building_area:
+                x, y, w, h = cv2.boundingRect(cnt)
                     
-                    aspect_ratio = max(w, h) / min(w, h)
+                aspect = w / h if h > 0 else 0
+                
+                # Здания обычно не сильно вытянутые
+                if 0.3 < aspect < 3.5 and min(w, h) > 20:
+                    # Проверяем прямоугольность
                     rect_area = w * h
-                    rectangularity = area / rect_area if rect_area > 0 else 0
+                    extent = area / rect_area if rect_area > 0 else 0
                     
-                    # Машина: прямоугольная, умеренно вытянутая
-                    # Расширено: aspect_ratio 1.2-3.0, rectangularity снижена до 0.50
-                    if 1.2 < aspect_ratio < 3.0 and rectangularity > 0.50:
-                        x, y, bw, bh = cv2.boundingRect(cnt)
+                    # Здания заполняют bounding box хотя бы на 45%
+                    if extent > 0.45:
+                        # Проверяем форму - количество углов
+                        epsilon = 0.02 * cv2.arcLength(cnt, True)
+                        approx = cv2.approxPolyDP(cnt, epsilon, True)
                         
-                        # Проверить однородность цвета
-                        if y+bh <= frame.shape[0] and x+bw <= frame.shape[1]:
-                            roi = frame[y:y+bh, x:x+bw]
-                            if roi.size > 0:
-                                roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-                                std_s = np.std(roi_hsv[:,:,1])
-                                std_v = np.std(roi_hsv[:,:,2])
-                                
-                                # Проверка компактности контура (машины компактные)
-                                perimeter = cv2.arcLength(cnt, True)
-                                compactness = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
-                                
-                                # Машина: однородный цвет И компактная форма
-                                # Компактность круга = 1, квадрата ~0.785, вытянутых < 0.5
-                                # Расширено std до 70 для учёта бликов на машинах
-                                if std_s < 70 and std_v < 70 and compactness > 0.4:
-                                    conf = min(0.85, 0.55 + rectangularity * 0.15 + compactness * 0.15)
-                                    cars.append({
-                                        'class': 'car',
-                                        'box': (x, y, x + bw, y + bh),
-                                        'confidence': conf,
-                                        'area': area,
-                                        'color': color_name
-                                    })
-            return cars
+                        # Прямоугольные формы имеют 4-10 углов
+                        if 4 <= len(approx) <= 12:
+                            confidence = min(0.85, extent * 0.6 + 0.35)
+                            
+                            detections.append({
+                                'class': 'building',
+                                'box': (x, y, x + w, y + h),
+                                'confidence': confidence
+                            })
         
-        # Белые машины - самый важный цвет для аэроснимков
-        # Повышен порог яркости (V >= 145) чтобы отсечь серый асфальт
-        # Уменьшен допуск насыщенности (S <= 50) для чистого белого
-        lower_white = np.array([0, 0, 145])
-        upper_white = np.array([180, 50, 255])
-        mask_white = cv2.inRange(hsv, lower_white, upper_white)
-        car_detections.extend(find_cars_in_mask(mask_white, 'white'))
+        print(f"CV2 детектировал {len(detections)} зданий (светлые области)")
+        return detections
+
+    def _detect_vehicles_cv2(self, frame):
+        """Детекция машин через CV2 - ищем прямоугольные объекты характерного размера."""
+        detections = []
         
-        # Чёрные/тёмные машины
-        lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 255, 50])
-        mask_black = cv2.inRange(hsv, lower_black, upper_black)
-        car_detections.extend(find_cars_in_mask(mask_black, 'black'))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Серые/серебристые машины (узкий диапазон чтобы не захватывать асфальт)
-        lower_gray = np.array([0, 0, 120])
-        upper_gray = np.array([180, 25, 170])
-        mask_gray = cv2.inRange(hsv, lower_gray, upper_gray)
-        car_detections.extend(find_cars_in_mask(mask_gray, 'gray'))
+        # Убираем чёрные границы мозаики
+        _, valid_mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
         
-        # Бежевые/песочные машины (светлые, но с насыщенностью - важно для аэроснимков!)
-        # Покрывает машины на песчаных дорогах с H=10-30 (жёлтые тона), S до 150, V высокая
-        lower_beige = np.array([10, 30, 120])
-        upper_beige = np.array([35, 150, 255])
-        mask_beige = cv2.inRange(hsv, lower_beige, upper_beige)
-        car_detections.extend(find_cars_in_mask(mask_beige, 'beige'))
+        # Ищем светлые объекты (белые/серые машины)
+        _, bright = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+        bright = cv2.bitwise_and(bright, valid_mask)
         
-        # Красные машины
-        mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
-        mask_red2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
-        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-        car_detections.extend(find_cars_in_mask(mask_red, 'red'))
+        # Морфология
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel, iterations=2)
+        bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        # Синие машины (включая светло-голубые/сине-серые)
-        # Снижен порог S с 80 до 50 для светло-голубых машин
-        mask_blue = cv2.inRange(hsv, np.array([90, 50, 100]), np.array([130, 255, 255]))
-        car_detections.extend(find_cars_in_mask(mask_blue, 'blue'))
+        contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Применить NMS для машин
-        for det in apply_nms(car_detections, 0.3):
-            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
-        
-        # Применить NMS и добавить к результатам
-        for det in apply_nms(fire_detections, 0.4):
-            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
-        for det in apply_nms(smoke_detections, 0.4):
-            detections.append({'class': det['class'], 'box': det['box'], 'confidence': det['confidence']})
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            
+            # Машины с вида сверху имеют площадь примерно 200-5000 пикселей
+            if 150 < area < 8000:
+                x, y, w, h = cv2.boundingRect(cnt)
+                aspect = w / h if h > 0 else 0
+                
+                # Машины обычно прямоугольные 1.5-3.5 : 1
+                if 0.3 < aspect < 4.0 and min(w, h) > 8 and max(w, h) < 150:
+                    rect_area = w * h
+                    extent = area / rect_area if rect_area > 0 else 0
+                    
+                    # Машины заполняют bbox на 50%+
+                    if extent > 0.5:
+                        detections.append({
+                            'class': 'car',
+                            'box': (x, y, x+w, y+h),
+                            'confidence': 0.3 + extent * 0.3
+                        })
         
         return detections
 
@@ -654,30 +716,40 @@ class VideMosaic:
         
         # Создать весовую маску с расстоянием от краёв для плавного перехода
         if np.any(overlap):
-            # Вычислить расстояние от краёв для обеих масок
-            dist_new = cv2.distanceTransform(mask_new, cv2.DIST_L2, 5)
-            dist_old = cv2.distanceTransform(mask_old, cv2.DIST_L2, 5)
-            
-            # Нормализовать расстояния для весов
-            dist_sum = dist_new + dist_old + 1e-6
-            weight_new = dist_new / dist_sum
-            weight_old = dist_old / dist_sum
-            
-            # Применить сильное размытие для очень плавных переходов
-            weight_new = cv2.GaussianBlur(weight_new.astype(np.float32), (51, 51), 0)
-            weight_old = cv2.GaussianBlur(weight_old.astype(np.float32), (51, 51), 0)
-            
-            # Расширить до 3 каналов
-            weight_new_3ch = np.stack([weight_new, weight_new, weight_new], axis=2)
-            weight_old_3ch = np.stack([weight_old, weight_old, weight_old], axis=2)
-            
-            # Плавное смешивание с учётом расстояния от краёв
-            blended = (self.output_img.astype(np.float32) * weight_old_3ch + 
-                      warped_img.astype(np.float32) * weight_new_3ch)
-            
-            # Применить блендинг только в области перекрытия
-            overlap_3ch = np.stack([overlap, overlap, overlap], axis=2) > 0
-            self.output_img = np.where(overlap_3ch, blended.astype(np.uint8), self.output_img)
+            try:
+                # Вычислить расстояние от краёв для обеих масок
+                dist_new = cv2.distanceTransform(mask_new, cv2.DIST_L2, 3)  # Уменьшен размер ядра
+                dist_old = cv2.distanceTransform(mask_old, cv2.DIST_L2, 3)
+                
+                # Нормализовать расстояния для весов
+                dist_sum = dist_new + dist_old + 1e-6
+                weight_new = dist_new / dist_sum
+                weight_old = dist_old / dist_sum
+                
+                # Применить размытие для плавных переходов (уменьшен размер ядра)
+                weight_new = cv2.GaussianBlur(weight_new.astype(np.float32), (31, 31), 0)
+                weight_old = cv2.GaussianBlur(weight_old.astype(np.float32), (31, 31), 0)
+                
+                # Расширить до 3 каналов
+                weight_new_3ch = np.stack([weight_new, weight_new, weight_new], axis=2)
+                weight_old_3ch = np.stack([weight_old, weight_old, weight_old], axis=2)
+                
+                # Плавное смешивание с учётом расстояния от краёв
+                blended = (self.output_img.astype(np.float32) * weight_old_3ch + 
+                          warped_img.astype(np.float32) * weight_new_3ch)
+                
+                # Применить блендинг только в области перекрытия
+                overlap_3ch = np.stack([overlap, overlap, overlap], axis=2) > 0
+                self.output_img = np.where(overlap_3ch, blended.astype(np.uint8), self.output_img)
+                
+                # Освобождаем память
+                del dist_new, dist_old, weight_new, weight_old, weight_new_3ch, weight_old_3ch, blended
+                gc.collect()
+                
+            except cv2.error as e:
+                # При нехватке памяти используем простое наложение
+                print(f"Предупреждение: упрощённое смешивание из-за нехватки памяти")
+                self.output_img[warped_img > 0] = warped_img[warped_img > 0]
             
             # В неперекрывающихся областях просто заменить
             non_overlap_new = cv2.bitwise_and(mask_new, cv2.bitwise_not(overlap)) > 0
@@ -1076,13 +1148,15 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
     for det in detections:
         if det['class'] in class_names_ru:  # Отображать все известные объекты
             x1, y1, x2, y2 = det['box']
-            # Цвет в зависимости от опасности
+            # Цвет в зависимости от типа объекта
             if det['class'] in ['fire', 'smoke']:
                 color = (0, 0, 255)  # Красный для опасных объектов
             elif det['class'] in ['car', 'truck', 'bus', 'motorcycle']:
                 color = (0, 165, 255)  # Оранжевый для транспорта
+            elif det['class'] == 'building':
+                color = (0, 255, 255)  # Жёлтый для зданий
             else:
-                color = (0, 255, 255)  # Желтый для остальных
+                color = (255, 255, 0)  # Голубой для остальных (люди, животные)
             
             cv2.rectangle(nav_map, (x1, y1), (x2, y2), color, 2)
             # Добавить подпись с процентом уверенности
@@ -1091,47 +1165,13 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
             label_with_conf = f"{label_text} {confidence_pct:.0f}%"
             labels_to_draw.append((label_with_conf, (x1, max(5, y1 - 18)), color))
 
-    # --- Новое: обнаружить цели типа зданий на мозаике (прямоугольные, большие контуры)
-    def detect_buildings(img, min_area=30):
-        # Попытаться более надежный многошаговый подход для поиска больших искусственных прямоугольных форм
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Использовать простой порог для лучшего обнаружения
-        _, th = cv2.threshold(blur, 125, 255, cv2.THRESH_BINARY_INV)
-
-        # Морфологическое закрытие для объединения областей крыш и удаления маленьких дырок
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-        # Обнаружение краев на закрытом изображении
-        edges = cv2.Canny(closed, 30, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        buildings = []
-        print(f"Найдено {len(contours)} контуров")
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)  # Более снисходительное приближение
-            x, y, w, h = cv2.boundingRect(approx)
-            rect_area = w * h
-            if rect_area <= 0:
-                continue
-            fill_ratio = area / float(rect_area)
-            # Ослабленные критерии для зданий
-            if fill_ratio > 0.05 and w > 5 and h > 5 and len(approx) >= 3:  # По крайней мере треугольник
-                # Вычислить уверенность на основе fill_ratio, размера и прямоугольности
-                # fill_ratio близко к 1.0 = более прямоугольное = выше уверенность
-                # Большая площадь = более вероятно здание
-                size_confidence = min(1.0, area / 1000.0)  # Нормализовать по размеру
-                shape_confidence = fill_ratio  # 0.05-1.0 диапазон
-                # Комбинированная уверенность (60% форма, 40% размер)
-                confidence = (shape_confidence * 0.6 + size_confidence * 0.4)
-                confidence = min(0.95, max(0.50, confidence))  # Ограничить 50-95%
-                buildings.append((x, y, x + w, y + h, confidence))
-        print(f"Обнаружено {len(buildings)} зданий")
-        return buildings
+    # Извлечь здания из детекций YOLO-World (вместо cv2-подхода)
+    buildings_from_yolo = []
+    for det in detections:
+        if det['class'] == 'building':
+            x1, y1, x2, y2 = det['box']
+            confidence = det.get('confidence', 0.5)
+            buildings_from_yolo.append((x1, y1, x2, y2, confidence))
 
     # Построить downsampled occupancy grid и использовать A* для маршрутизации.
     def find_path_astar(start_px, goal_px, obstacle_mask, scale=4):
@@ -1188,13 +1228,14 @@ def analyze_for_navigation(frame, detections, start_point=None, compute_paths=Tr
     def worker_compute_paths(result_dict):
         try:
             print("Вычисление путей...")
-            buildings = detect_buildings(frame)
+            # Используем здания из YOLO-World детекций (вместо cv2-подхода)
+            buildings = buildings_from_yolo
             
             result_dict['buildings'] = buildings
             overlays = []
             labels = []
             worker_nav = nav_map.copy()
-            print(f"Обнаружено {len(buildings)} зданий")
+            print(f"YOLO-World обнаружил {len(buildings)} зданий")
             
             # Пропустить построение путей если compute_paths=False
             if not compute_paths:
