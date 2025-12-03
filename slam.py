@@ -744,6 +744,879 @@ def visualize_trajectory_3d(trajectory: np.ndarray):
     )
 
 
+# ============================================================
+# ПРОДВИНУТЫЙ АНАЛИЗАТОР ЗЕМЛИ И ПОЧВЫ
+# ============================================================
+
+class TerrainSoilAnalyzer:
+    """
+    Продвинутый анализатор земли и почвы по изображению.
+    
+    Функции:
+    - Классификация типа почвы по цвету и текстуре
+    - Оценка влажности почвы
+    - Определение плодородности
+    - Анализ структуры поверхности
+    - Определение типа растительного покрова
+    - Выявление эрозии и дефектов
+    """
+    
+    # Справочник типов почв с характеристиками (HSV диапазоны)
+    SOIL_TYPES = {
+        'chernozem': {
+            'name': 'Чернозём',
+            'name_en': 'Chernozem (Black Soil)',
+            'hsv_range': [(0, 0, 0), (180, 100, 80)],
+            'color_desc': 'Тёмно-коричневый до чёрного',
+            'fertility': 'Очень высокая',
+            'fertility_score': 95,
+            'organic_matter': '6-15%',
+            'ph_range': '6.5-7.5',
+            'water_retention': 'Высокая',
+            'suitable_crops': ['пшеница', 'кукуруза', 'подсолнечник', 'сахарная свёкла'],
+            'regions': 'Украина, Юг России, Казахстан'
+        },
+        'podzol': {
+            'name': 'Подзолистая',
+            'name_en': 'Podzol',
+            'hsv_range': [(10, 20, 100), (30, 80, 200)],
+            'color_desc': 'Светло-серый',
+            'fertility': 'Низкая',
+            'fertility_score': 30,
+            'organic_matter': '1-4%',
+            'ph_range': '4.5-5.5',
+            'water_retention': 'Низкая',
+            'suitable_crops': ['картофель', 'рожь', 'овёс', 'лён'],
+            'regions': 'Северная Россия, Скандинавия, Канада'
+        },
+        'clay': {
+            'name': 'Глинистая',
+            'name_en': 'Clay Soil',
+            'hsv_range': [(5, 50, 80), (25, 200, 180)],
+            'color_desc': 'Красно-коричневый, жёлто-коричневый',
+            'fertility': 'Средняя',
+            'fertility_score': 55,
+            'organic_matter': '2-5%',
+            'ph_range': '5.5-7.0',
+            'water_retention': 'Очень высокая (плохой дренаж)',
+            'suitable_crops': ['рис', 'капуста', 'брокколи'],
+            'regions': 'Повсеместно'
+        },
+        'sandy': {
+            'name': 'Песчаная',
+            'name_en': 'Sandy Soil',
+            'hsv_range': [(15, 30, 150), (35, 120, 255)],
+            'color_desc': 'Светло-жёлтый, бежевый',
+            'fertility': 'Низкая',
+            'fertility_score': 25,
+            'organic_matter': '0.5-2%',
+            'ph_range': '5.5-7.0',
+            'water_retention': 'Очень низкая',
+            'suitable_crops': ['морковь', 'картофель', 'арбузы', 'дыни'],
+            'regions': 'Пустыни, прибрежные зоны'
+        },
+        'loam': {
+            'name': 'Суглинок',
+            'name_en': 'Loam Soil',
+            'hsv_range': [(8, 40, 80), (25, 150, 160)],
+            'color_desc': 'Коричневый',
+            'fertility': 'Высокая',
+            'fertility_score': 80,
+            'organic_matter': '3-6%',
+            'ph_range': '6.0-7.0',
+            'water_retention': 'Хорошая (сбалансированная)',
+            'suitable_crops': ['томаты', 'перец', 'зерновые', 'бобовые'],
+            'regions': 'Умеренный климат повсеместно'
+        },
+        'red_soil': {
+            'name': 'Красная почва (Латерит)',
+            'name_en': 'Red Soil (Laterite)',
+            'hsv_range': [(0, 100, 80), (15, 255, 200)],
+            'color_desc': 'Красный, красно-оранжевый',
+            'fertility': 'Средняя (требует удобрений)',
+            'fertility_score': 45,
+            'organic_matter': '1-3%',
+            'ph_range': '5.0-6.5',
+            'water_retention': 'Средняя',
+            'suitable_crops': ['хлопок', 'арахис', 'табак', 'цитрусовые'],
+            'regions': 'Тропики, Индия, Африка, Бразилия'
+        },
+        'peaty': {
+            'name': 'Торфяная',
+            'name_en': 'Peaty Soil',
+            'hsv_range': [(0, 30, 20), (30, 100, 70)],
+            'color_desc': 'Тёмно-коричневый до чёрного (волокнистый)',
+            'fertility': 'Высокая (после мелиорации)',
+            'fertility_score': 70,
+            'organic_matter': '20-80%',
+            'ph_range': '3.5-5.5',
+            'water_retention': 'Очень высокая (заболоченность)',
+            'suitable_crops': ['клюква', 'голубика', 'овощи (после осушения)'],
+            'regions': 'Болота, Северная Европа, Канада'
+        },
+        'calcarite': {
+            'name': 'Известковая (Карбонатная)',
+            'name_en': 'Calcareous Soil',
+            'hsv_range': [(20, 10, 180), (40, 60, 255)],
+            'color_desc': 'Светлый, белёсый, серо-белый',
+            'fertility': 'Средняя',
+            'fertility_score': 50,
+            'organic_matter': '1-4%',
+            'ph_range': '7.5-8.5',
+            'water_retention': 'Средняя',
+            'suitable_crops': ['виноград', 'оливки', 'лаванда', 'зерновые'],
+            'regions': 'Средиземноморье, степи'
+        }
+    }
+    
+    # Типы растительного покрова
+    VEGETATION_TYPES = {
+        'dense_grass': {'name': 'Густая трава', 'green_ratio': (0.6, 1.0), 'health': 'Отлично'},
+        'sparse_grass': {'name': 'Редкая трава', 'green_ratio': (0.3, 0.6), 'health': 'Хорошо'},
+        'dry_grass': {'name': 'Сухая трава', 'green_ratio': (0.1, 0.3), 'health': 'Плохо'},
+        'bare_soil': {'name': 'Голая почва', 'green_ratio': (0.0, 0.1), 'health': 'Нет растительности'},
+        'forest': {'name': 'Лесной покров', 'green_ratio': (0.7, 1.0), 'health': 'Отлично'},
+        'shrubs': {'name': 'Кустарники', 'green_ratio': (0.4, 0.7), 'health': 'Хорошо'}
+    }
+    
+    def __init__(self):
+        """Инициализация анализатора."""
+        self.analysis_results = {}
+        
+    def analyze_image(self, image: np.ndarray) -> Dict:
+        """
+        Полный анализ изображения земли/почвы.
+        
+        Args:
+            image: BGR изображение
+            
+        Returns:
+            Словарь с результатами анализа
+        """
+        results = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'image_size': f"{image.shape[1]}x{image.shape[0]}",
+            'soil_analysis': self._analyze_soil(image),
+            'moisture_analysis': self._analyze_moisture(image),
+            'vegetation_analysis': self._analyze_vegetation(image),
+            'texture_analysis': self._analyze_texture(image),
+            'erosion_analysis': self._analyze_erosion(image),
+            'recommendations': []
+        }
+        
+        # Генерация рекомендаций
+        results['recommendations'] = self._generate_recommendations(results)
+        
+        self.analysis_results = results
+        return results
+    
+    def _analyze_soil(self, image: np.ndarray) -> Dict:
+        """Анализ типа почвы по цвету."""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Средние значения HSV
+        h_mean = np.mean(hsv[:, :, 0])
+        s_mean = np.mean(hsv[:, :, 1])
+        v_mean = np.mean(hsv[:, :, 2])
+        
+        # Средние значения BGR
+        b_mean = np.mean(image[:, :, 0])
+        g_mean = np.mean(image[:, :, 1])
+        r_mean = np.mean(image[:, :, 2])
+        
+        # Определение типа почвы по цветовым характеристикам
+        soil_scores = {}
+        
+        for soil_type, properties in self.SOIL_TYPES.items():
+            score = 0
+            
+            # Проверка яркости (V)
+            if soil_type == 'chernozem' and v_mean < 80:
+                score += 40
+            elif soil_type == 'sandy' and v_mean > 150:
+                score += 40
+            elif soil_type == 'calcarite' and v_mean > 180:
+                score += 35
+            elif soil_type == 'podzol' and 100 < v_mean < 180 and s_mean < 60:
+                score += 35
+            elif soil_type == 'red_soil' and r_mean > g_mean * 1.3 and r_mean > b_mean * 1.5:
+                score += 45
+            elif soil_type == 'clay' and 80 < v_mean < 160 and r_mean > b_mean:
+                score += 30
+            elif soil_type == 'loam' and 80 < v_mean < 150:
+                score += 25
+            elif soil_type == 'peaty' and v_mean < 70 and s_mean < 80:
+                score += 35
+            
+            # Проверка насыщенности
+            if soil_type in ['red_soil', 'clay'] and s_mean > 80:
+                score += 20
+            elif soil_type in ['podzol', 'calcarite'] and s_mean < 50:
+                score += 20
+            elif soil_type == 'chernozem' and s_mean < 100:
+                score += 15
+            
+            # Проверка оттенка
+            if soil_type == 'red_soil' and h_mean < 15:
+                score += 20
+            elif soil_type in ['sandy', 'loam', 'clay'] and 10 < h_mean < 30:
+                score += 15
+            
+            soil_scores[soil_type] = score
+        
+        # Определение наиболее вероятного типа
+        best_soil = max(soil_scores, key=soil_scores.get)
+        confidence = min(100, soil_scores[best_soil])
+        
+        soil_info = self.SOIL_TYPES[best_soil]
+        
+        return {
+            'type': best_soil,
+            'name': soil_info['name'],
+            'name_en': soil_info['name_en'],
+            'confidence': confidence,
+            'color_description': soil_info['color_desc'],
+            'fertility': soil_info['fertility'],
+            'fertility_score': soil_info['fertility_score'],
+            'organic_matter': soil_info['organic_matter'],
+            'ph_range': soil_info['ph_range'],
+            'water_retention': soil_info['water_retention'],
+            'suitable_crops': soil_info['suitable_crops'],
+            'typical_regions': soil_info['regions'],
+            'color_stats': {
+                'hsv_mean': [float(h_mean), float(s_mean), float(v_mean)],
+                'rgb_mean': [float(r_mean), float(g_mean), float(b_mean)]
+            },
+            'all_scores': soil_scores
+        }
+    
+    def _analyze_moisture(self, image: np.ndarray) -> Dict:
+        """Анализ влажности почвы по цвету."""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Влажная почва обычно темнее
+        v_mean = np.mean(hsv[:, :, 2])
+        s_mean = np.mean(hsv[:, :, 1])
+        
+        # Вычисление индекса влажности (чем темнее, тем влажнее)
+        # Также влажная почва менее насыщенная по цвету
+        darkness_factor = max(0, (100 - v_mean / 2.55)) / 100
+        saturation_factor = max(0, 1 - s_mean / 255 * 0.3)
+        
+        moisture_index = darkness_factor * 0.7 + saturation_factor * 0.3
+        moisture_percent = min(100, moisture_index * 100)
+        
+        # Классификация уровня влажности
+        if moisture_percent > 70:
+            level = 'Очень высокая (переувлажнение)'
+            status = 'warning'
+            drainage_needed = True
+        elif moisture_percent > 50:
+            level = 'Высокая'
+            status = 'good'
+            drainage_needed = False
+        elif moisture_percent > 30:
+            level = 'Умеренная (оптимально)'
+            status = 'optimal'
+            drainage_needed = False
+        elif moisture_percent > 15:
+            level = 'Низкая'
+            status = 'warning'
+            drainage_needed = False
+        else:
+            level = 'Очень низкая (засуха)'
+            status = 'critical'
+            drainage_needed = False
+        
+        return {
+            'moisture_index': round(moisture_percent, 1),
+            'level': level,
+            'status': status,
+            'drainage_needed': drainage_needed,
+            'irrigation_recommendation': 'Требуется полив' if moisture_percent < 30 else 
+                                         'Полив не требуется' if moisture_percent < 70 else 
+                                         'Требуется дренаж'
+        }
+    
+    def _analyze_vegetation(self, image: np.ndarray) -> Dict:
+        """Анализ растительного покрова."""
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Маска зелёного цвета (растительность)
+        green_lower = np.array([35, 40, 40])
+        green_upper = np.array([85, 255, 255])
+        green_mask = cv2.inRange(hsv, green_lower, green_upper)
+        
+        # Маска жёлтого/коричневого (сухая растительность)
+        dry_lower = np.array([15, 40, 80])
+        dry_upper = np.array([35, 200, 200])
+        dry_mask = cv2.inRange(hsv, dry_lower, dry_upper)
+        
+        total_pixels = image.shape[0] * image.shape[1]
+        green_pixels = np.sum(green_mask > 0)
+        dry_pixels = np.sum(dry_mask > 0)
+        
+        green_ratio = green_pixels / total_pixels
+        dry_ratio = dry_pixels / total_pixels
+        bare_ratio = 1 - green_ratio - dry_ratio
+        
+        # Определение типа покрова
+        if green_ratio > 0.7:
+            cover_type = 'Густая зелёная растительность'
+            health = 'Отлично'
+            ndvi_estimate = 0.7 + green_ratio * 0.3
+        elif green_ratio > 0.4:
+            cover_type = 'Умеренная растительность'
+            health = 'Хорошо'
+            ndvi_estimate = 0.4 + green_ratio * 0.5
+        elif green_ratio > 0.2:
+            cover_type = 'Редкая растительность'
+            health = 'Удовлетворительно'
+            ndvi_estimate = 0.2 + green_ratio * 0.5
+        elif dry_ratio > 0.3:
+            cover_type = 'Сухая/увядающая растительность'
+            health = 'Плохо'
+            ndvi_estimate = 0.1 + dry_ratio * 0.2
+        else:
+            cover_type = 'Преимущественно голая почва'
+            health = 'Нет растительности'
+            ndvi_estimate = -0.1 + green_ratio
+        
+        return {
+            'cover_type': cover_type,
+            'health_status': health,
+            'green_cover_percent': round(green_ratio * 100, 1),
+            'dry_vegetation_percent': round(dry_ratio * 100, 1),
+            'bare_soil_percent': round(max(0, bare_ratio) * 100, 1),
+            'ndvi_estimate': round(ndvi_estimate, 2),
+            'photosynthesis_activity': 'Высокая' if green_ratio > 0.5 else 
+                                       'Средняя' if green_ratio > 0.2 else 'Низкая'
+        }
+    
+    def _analyze_texture(self, image: np.ndarray) -> Dict:
+        """Анализ текстуры поверхности почвы."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Вычисление градиентов (Sobel)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+        
+        # Лапласиан для детектирования резкости
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian_var = laplacian.var()
+        
+        # GLCM-подобные метрики (упрощённо)
+        # Контраст
+        contrast = np.std(gray)
+        
+        # Однородность (обратно пропорциональна дисперсии градиента)
+        homogeneity = 1 / (1 + np.std(gradient_magnitude) / 100)
+        
+        # Шероховатость
+        roughness = np.mean(gradient_magnitude)
+        
+        # Классификация текстуры
+        if roughness > 50:
+            texture_type = 'Очень грубая (комковатая)'
+            particle_size = 'Крупные комки'
+        elif roughness > 30:
+            texture_type = 'Грубая'
+            particle_size = 'Крупнозернистая'
+        elif roughness > 15:
+            texture_type = 'Средняя'
+            particle_size = 'Среднезернистая'
+        elif roughness > 8:
+            texture_type = 'Мелкая'
+            particle_size = 'Мелкозернистая'
+        else:
+            texture_type = 'Очень мелкая (гладкая)'
+            particle_size = 'Пылеватая/илистая'
+        
+        return {
+            'texture_type': texture_type,
+            'particle_size': particle_size,
+            'roughness_index': round(roughness, 2),
+            'contrast': round(contrast, 2),
+            'homogeneity': round(homogeneity, 3),
+            'sharpness': round(laplacian_var, 2),
+            'compaction_estimate': 'Высокая' if roughness < 10 else 
+                                   'Средняя' if roughness < 25 else 'Низкая (рыхлая)'
+        }
+    
+    def _analyze_erosion(self, image: np.ndarray) -> Dict:
+        """Анализ признаков эрозии."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Детектирование линий (потенциальные борозды эрозии)
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, 
+                                minLineLength=30, maxLineGap=10)
+        
+        num_lines = len(lines) if lines is not None else 0
+        
+        # Анализ вариации яркости (пятнистость = возможные вымытые участки)
+        v_std = np.std(hsv[:, :, 2])
+        
+        # Определение уровня эрозии
+        erosion_indicators = 0
+        erosion_types = []
+        
+        if num_lines > 50:
+            erosion_indicators += 30
+            erosion_types.append('Линейная (ручейковая)')
+        
+        if v_std > 60:
+            erosion_indicators += 25
+            erosion_types.append('Пятнистая (вымывание)')
+        
+        # Проверка на оголённые участки
+        low_sat_mask = hsv[:, :, 1] < 30
+        low_sat_ratio = np.sum(low_sat_mask) / (image.shape[0] * image.shape[1])
+        if low_sat_ratio > 0.3:
+            erosion_indicators += 20
+            erosion_types.append('Обнажение подпочвы')
+        
+        # Классификация
+        if erosion_indicators > 50:
+            level = 'Высокая'
+            status = 'critical'
+        elif erosion_indicators > 25:
+            level = 'Умеренная'
+            status = 'warning'
+        elif erosion_indicators > 10:
+            level = 'Слабая'
+            status = 'attention'
+        else:
+            level = 'Минимальная или отсутствует'
+            status = 'good'
+        
+        return {
+            'erosion_level': level,
+            'erosion_index': erosion_indicators,
+            'status': status,
+            'detected_types': erosion_types if erosion_types else ['Не обнаружено'],
+            'linear_features_count': num_lines,
+            'surface_variability': round(v_std, 2),
+            'protection_recommended': erosion_indicators > 25
+        }
+    
+    def _generate_recommendations(self, results: Dict) -> List[str]:
+        """Генерация рекомендаций на основе анализа."""
+        recommendations = []
+        
+        soil = results['soil_analysis']
+        moisture = results['moisture_analysis']
+        vegetation = results['vegetation_analysis']
+        erosion = results['erosion_analysis']
+        
+        # Рекомендации по почве
+        if soil['fertility_score'] < 40:
+            recommendations.append(f"⚠️ Низкая плодородность ({soil['name']}). "
+                                   "Рекомендуется внесение органических удобрений.")
+        
+        # Рекомендации по влажности
+        if moisture['status'] == 'critical':
+            recommendations.append("🔴 Критически низкая влажность! Срочно требуется ирригация.")
+        elif moisture['status'] == 'warning' and moisture['moisture_index'] > 70:
+            recommendations.append("⚠️ Переувлажнение почвы. Необходим дренаж.")
+        elif moisture['moisture_index'] < 30:
+            recommendations.append("💧 Рекомендуется регулярный полив.")
+        
+        # Рекомендации по растительности
+        if vegetation['green_cover_percent'] < 20:
+            recommendations.append("Низкий растительный покров. "
+                                   "Рекомендуется посев покровных культур для защиты почвы.")
+        elif vegetation['health_status'] == 'Плохо':
+            recommendations.append("Растительность в плохом состоянии. "
+                                   "Проверьте питательные вещества и влажность.")
+        
+        # Рекомендации по эрозии
+        if erosion['status'] == 'critical':
+            recommendations.append("Высокий риск эрозии! Необходимы срочные меры: "
+                                   "террасирование, посадка защитных полос.")
+        elif erosion['protection_recommended']:
+            recommendations.append("Рекомендуется установка противоэрозионных мер.")
+        
+        # Рекомендации по культурам
+        if soil['fertility_score'] > 60:
+            crops = ', '.join(soil['suitable_crops'][:3])
+            recommendations.append(f"Подходящие культуры для данной почвы: {crops}")
+        
+        if not recommendations:
+            recommendations.append("Состояние почвы и покрова в норме. "
+                                   "Продолжайте текущие агротехнические мероприятия.")
+        
+        return recommendations
+    
+    def visualize_analysis(self, image: np.ndarray, results: Dict = None) -> np.ndarray:
+        """
+        Создание визуализации анализа.
+        """
+        if results is None:
+            results = self.analysis_results
+        
+        if not results:
+            # Если нет результатов, просто вернём изображение с надписью
+            vis = image.copy()
+            cv2.putText(vis, "Analyzing...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                        1, (0, 255, 255), 2, cv2.LINE_AA)
+            return vis
+        
+        # Создание визуализации
+        h, w = image.shape[:2]
+        
+        # Панель с информацией справа
+        panel_width = 400
+        vis = np.zeros((max(h, 700), w + panel_width, 3), dtype=np.uint8)
+        vis[:h, :w] = image
+        
+        # Фон панели
+        vis[:, w:] = (40, 40, 40)
+        
+        # Текст на панели
+        y_offset = 30
+        line_height = 25
+        x_pos = w + 10
+        
+        def put_text(text, y, color=(255, 255, 255), scale=0.5):
+            cv2.putText(vis, str(text), (x_pos, y), cv2.FONT_HERSHEY_SIMPLEX, 
+                        scale, color, 1, cv2.LINE_AA)
+        
+        # Заголовок
+        put_text("=== АНАЛИЗ ПОЧВЫ ===", y_offset, (0, 255, 255), 0.7)
+        y_offset += line_height + 10
+        
+        # Тип почвы
+        soil = results['soil_analysis']
+        put_text(f"Тип: {soil['name']}", y_offset, (100, 255, 100))
+        y_offset += line_height
+        put_text(f"({soil['name_en']})", y_offset, (150, 150, 150), 0.4)
+        y_offset += line_height
+        put_text(f"Уверенность: {soil['confidence']}%", y_offset)
+        y_offset += line_height
+        put_text(f"Плодородность: {soil['fertility']}", y_offset)
+        y_offset += line_height
+        put_text(f"pH: {soil['ph_range']}", y_offset)
+        y_offset += line_height + 10
+        
+        # Влажность
+        put_text("=== ВЛАЖНОСТЬ ===", y_offset, (0, 255, 255), 0.6)
+        y_offset += line_height
+        moisture = results['moisture_analysis']
+        color = (0, 255, 0) if moisture['status'] == 'optimal' else \
+                (0, 255, 255) if moisture['status'] == 'good' else \
+                (0, 165, 255) if moisture['status'] == 'warning' else (0, 0, 255)
+        put_text(f"Уровень: {moisture['level']}", y_offset, color)
+        y_offset += line_height
+        put_text(f"Индекс: {moisture['moisture_index']}%", y_offset)
+        y_offset += line_height + 10
+        
+        # Растительность
+        put_text("=== РАСТИТЕЛЬНОСТЬ ===", y_offset, (0, 255, 255), 0.6)
+        y_offset += line_height
+        veg = results['vegetation_analysis']
+        put_text(f"Покров: {veg['cover_type']}", y_offset, (100, 255, 100))
+        y_offset += line_height
+        put_text(f"Зелёный: {veg['green_cover_percent']}%", y_offset)
+        y_offset += line_height
+        put_text(f"NDVI (оценка): {veg['ndvi_estimate']}", y_offset)
+        y_offset += line_height + 10
+        
+        # Текстура
+        put_text("=== ТЕКСТУРА ===", y_offset, (0, 255, 255), 0.6)
+        y_offset += line_height
+        tex = results['texture_analysis']
+        put_text(f"Тип: {tex['texture_type']}", y_offset)
+        y_offset += line_height
+        put_text(f"Частицы: {tex['particle_size']}", y_offset)
+        y_offset += line_height + 10
+        
+        # Эрозия
+        put_text("=== ЭРОЗИЯ ===", y_offset, (0, 255, 255), 0.6)
+        y_offset += line_height
+        eros = results['erosion_analysis']
+        color = (0, 255, 0) if eros['status'] == 'good' else \
+                (0, 255, 255) if eros['status'] == 'attention' else \
+                (0, 165, 255) if eros['status'] == 'warning' else (0, 0, 255)
+        put_text(f"Уровень: {eros['erosion_level']}", y_offset, color)
+        y_offset += line_height
+        
+        return vis
+    
+    def print_report(self, results: Dict = None):
+        """Вывод текстового отчёта."""
+        if results is None:
+            results = self.analysis_results
+        
+        if not results:
+            print("Нет данных для отчёта. Сначала выполните анализ.")
+            return
+        
+        print("\n" + "=" * 70)
+        print("           ОТЧЁТ АНАЛИЗА ЗЕМЛИ И ПОЧВЫ")
+        print("=" * 70)
+        print(f"Дата анализа: {results['timestamp']}")
+        print(f"Размер изображения: {results['image_size']}")
+        
+        # Почва
+        soil = results['soil_analysis']
+        print("\n" + "-" * 40)
+        print("АНАЛИЗ ПОЧВЫ")
+        print("-" * 40)
+        print(f"  Тип почвы: {soil['name']} ({soil['name_en']})")
+        print(f"  Уверенность: {soil['confidence']}%")
+        print(f"  Цвет: {soil['color_description']}")
+        print(f"  Плодородность: {soil['fertility']} ({soil['fertility_score']}/100)")
+        print(f"  Органическое вещество: {soil['organic_matter']}")
+        print(f"  pH диапазон: {soil['ph_range']}")
+        print(f"  Водоудержание: {soil['water_retention']}")
+        print(f"  Типичные регионы: {soil['typical_regions']}")
+        print(f"  Подходящие культуры: {', '.join(soil['suitable_crops'])}")
+        
+        # Влажность
+        moisture = results['moisture_analysis']
+        print("\n" + "-" * 40)
+        print("АНАЛИЗ ВЛАЖНОСТИ")
+        print("-" * 40)
+        print(f"  Индекс влажности: {moisture['moisture_index']}%")
+        print(f"  Уровень: {moisture['level']}")
+        print(f"  Рекомендация: {moisture['irrigation_recommendation']}")
+        
+        # Растительность
+        veg = results['vegetation_analysis']
+        print("\n" + "-" * 40)
+        print("АНАЛИЗ РАСТИТЕЛЬНОСТИ")
+        print("-" * 40)
+        print(f"  Тип покрова: {veg['cover_type']}")
+        print(f"  Состояние: {veg['health_status']}")
+        print(f"  Зелёный покров: {veg['green_cover_percent']}%")
+        print(f"  Сухая растительность: {veg['dry_vegetation_percent']}%")
+        print(f"  Голая почва: {veg['bare_soil_percent']}%")
+        print(f"  NDVI (оценка): {veg['ndvi_estimate']}")
+        
+        # Текстура
+        tex = results['texture_analysis']
+        print("\n" + "-" * 40)
+        print("АНАЛИЗ ТЕКСТУРЫ")
+        print("-" * 40)
+        print(f"  Тип текстуры: {tex['texture_type']}")
+        print(f"  Размер частиц: {tex['particle_size']}")
+        print(f"  Шероховатость: {tex['roughness_index']}")
+        print(f"  Уплотнение: {tex['compaction_estimate']}")
+        
+        # Эрозия
+        eros = results['erosion_analysis']
+        print("\n" + "-" * 40)
+        print("АНАЛИЗ ЭРОЗИИ")
+        print("-" * 40)
+        print(f"  Уровень эрозии: {eros['erosion_level']}")
+        print(f"  Индекс: {eros['erosion_index']}")
+        print(f"  Обнаруженные типы: {', '.join(eros['detected_types'])}")
+        
+        # Рекомендации
+        print("\n" + "-" * 40)
+        print("РЕКОМЕНДАЦИИ")
+        print("-" * 40)
+        for rec in results['recommendations']:
+            print(f"  {rec}")
+        
+        print("\n" + "=" * 70)
+
+
+def run_soil_analyzer():
+    """Запуск анализатора почвы."""
+    print("\n" + "=" * 60)
+    print("      ПРОДВИНУТЫЙ АНАЛИЗАТОР ЗЕМЛИ И ПОЧВЫ")
+    print("=" * 60)
+    
+    analyzer = TerrainSoilAnalyzer()
+    
+    while True:
+        print("\n1. Анализ изображения из файла")
+        print("2. Анализ с веб-камеры (одиночный кадр)")
+        print("3. Анализ с веб-камеры (реальное время)")
+        print("4. Анализ всех изображений в папке")
+        print("5. Информация о типах почв")
+        print("6. Назад в главное меню")
+        print("-" * 40)
+        
+        choice = input("Выберите опцию (1-6): ").strip()
+        
+        if choice == '1':
+            # Анализ из файла
+            image_path = input("Введите путь к изображению: ").strip()
+            if not os.path.exists(image_path):
+                # Проверка в папке Data
+                if os.path.exists(os.path.join("Data", image_path)):
+                    image_path = os.path.join("Data", image_path)
+                else:
+                    print("Файл не найден!")
+                    continue
+            
+            image = cv2.imread(image_path)
+            if image is None:
+                print("Не удалось загрузить изображение!")
+                continue
+            
+            print("\nАнализ изображения...")
+            results = analyzer.analyze_image(image)
+            analyzer.print_report(results)
+            
+            # Визуализация
+            vis = analyzer.visualize_analysis(image, results)
+            cv2.imshow("Soil Analysis", vis)
+            print("\nНажмите любую клавишу для закрытия...")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            
+            # Сохранение
+            save = input("\nСохранить отчёт? (y/n): ").strip().lower()
+            if save == 'y':
+                os.makedirs("test_output", exist_ok=True)
+                cv2.imwrite("test_output/soil_analysis_result.jpg", vis)
+                
+                # Сохранение текстового отчёта
+                with open("test_output/soil_analysis_report.txt", 'w', encoding='utf-8') as f:
+                    f.write(f"Отчёт анализа почвы\n")
+                    f.write(f"Дата: {results['timestamp']}\n")
+                    f.write(f"Файл: {image_path}\n\n")
+                    f.write(f"Тип почвы: {results['soil_analysis']['name']}\n")
+                    f.write(f"Влажность: {results['moisture_analysis']['moisture_index']}%\n")
+                    f.write(f"Растительность: {results['vegetation_analysis']['green_cover_percent']}%\n")
+                
+                print("Сохранено в test_output/")
+        
+        elif choice == '2':
+            # Одиночный кадр с камеры
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Камера недоступна!")
+                continue
+            
+            print("Нажмите ПРОБЕЛ для захвата или Q для выхода")
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                
+                cv2.imshow("Camera - Press SPACE to capture", frame)
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord(' '):
+                    print("\nАнализ захваченного кадра...")
+                    results = analyzer.analyze_image(frame)
+                    analyzer.print_report(results)
+                    
+                    vis = analyzer.visualize_analysis(frame, results)
+                    cv2.imshow("Soil Analysis", vis)
+                    cv2.waitKey(0)
+                    break
+                elif key == ord('q'):
+                    break
+            
+            cap.release()
+            cv2.destroyAllWindows()
+        
+        elif choice == '3':
+            # Реальное время
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Камера недоступна!")
+                continue
+            
+            print("Анализ в реальном времени. Нажмите Q для выхода.")
+            
+            frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                
+                frame_count += 1
+                
+                # Анализ каждые 10 кадров для производительности
+                if frame_count % 10 == 0:
+                    results = analyzer.analyze_image(frame)
+                    vis = analyzer.visualize_analysis(frame, results)
+                else:
+                    vis = analyzer.visualize_analysis(frame)
+                
+                cv2.imshow("Soil Analysis - Real-time", vis)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            
+            cap.release()
+            cv2.destroyAllWindows()
+        
+        elif choice == '4':
+            # Анализ всех изображений в папке
+            folder = input("Введите путь к папке (Enter для 'Data'): ").strip() or "Data"
+            
+            if not os.path.exists(folder):
+                print("Папка не найдена!")
+                continue
+            
+            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+            images = [f for f in os.listdir(folder) 
+                      if any(f.lower().endswith(ext) for ext in image_extensions)]
+            
+            if not images:
+                print("Изображения не найдены!")
+                continue
+            
+            print(f"\nНайдено {len(images)} изображений. Начинаем анализ...")
+            
+            os.makedirs("test_output/soil_batch", exist_ok=True)
+            
+            for i, img_name in enumerate(images, 1):
+                img_path = os.path.join(folder, img_name)
+                image = cv2.imread(img_path)
+                
+                if image is None:
+                    print(f"  [{i}/{len(images)}] Ошибка загрузки: {img_name}")
+                    continue
+                
+                results = analyzer.analyze_image(image)
+                soil_type = results['soil_analysis']['name']
+                moisture = results['moisture_analysis']['moisture_index']
+                
+                print(f"  [{i}/{len(images)}] {img_name}: {soil_type}, влажность {moisture}%")
+                
+                # Сохранение визуализации
+                vis = analyzer.visualize_analysis(image, results)
+                out_name = f"analysis_{os.path.splitext(img_name)[0]}.jpg"
+                cv2.imwrite(f"test_output/soil_batch/{out_name}", vis)
+            
+            print(f"\nРезультаты сохранены в test_output/soil_batch/")
+        
+        elif choice == '5':
+            # Информация о типах почв
+            print("\n" + "=" * 70)
+            print("              СПРАВОЧНИК ТИПОВ ПОЧВ")
+            print("=" * 70)
+            
+            for soil_type, info in analyzer.SOIL_TYPES.items():
+                print(f"\n{info['name']} ({info['name_en']})")
+                print("-" * 50)
+                print(f"  Цвет: {info['color_desc']}")
+                print(f"  Плодородность: {info['fertility']} ({info['fertility_score']}/100)")
+                print(f"  Органика: {info['organic_matter']}")
+                print(f"  pH: {info['ph_range']}")
+                print(f"  Водоудержание: {info['water_retention']}")
+                print(f"  Культуры: {', '.join(info['suitable_crops'])}")
+                print(f"  Регионы: {info['regions']}")
+        
+        elif choice == '6':
+            break
+        
+        else:
+            print("Некорректный выбор")
+
+
 def main_menu():
     """
     Главное меню SLAM.
@@ -756,10 +1629,11 @@ def main_menu():
         print("2. Запустить SLAM на веб-камере")
         print("3. Загрузить и визуализировать траекторию (3D)")
         print("4. Информация о SLAM библиотеках")
-        print("5. Выход")
+        print("5. Анализатор земли и почвы")
+        print("6. Выход")
         print("-" * 60)
         
-        choice = input("Выберите опцию (1-5): ").strip()
+        choice = input("Выберите опцию (1-6): ").strip()
         
         if choice == '1':
             # Выбор видеофайла
@@ -826,6 +1700,9 @@ def main_menu():
             print(SLAM_LIBRARIES_INFO)
         
         elif choice == '5':
+            run_soil_analyzer()
+        
+        elif choice == '6':
             print("\nВыход из программы")
             break
         
