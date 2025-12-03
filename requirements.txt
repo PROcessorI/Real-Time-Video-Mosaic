@@ -1,7 +1,19 @@
 opencv-python
+opencv-contrib-python
 numpy
 ultralytics
 pathfinding
 Pillow
 customtkinter
 flask
+
+# Для работы с облаками точек и 3D
+open3d
+pyvista
+
+# Для лидарных данных (опционально)
+laspy
+lazrs
+
+# Для Intel RealSense (опционально)
+# pyrealsense2

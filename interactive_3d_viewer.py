@@ -289,6 +289,9 @@ def main():
         
         if file_type == 'ply':
             # Проверяем, mesh это или облако точек
+            if not OPEN3D_AVAILABLE:
+                print("Open3D не установлен! Установите: pip install open3d")
+                return
             mesh = o3d.io.read_triangle_mesh(filepath)
             if len(mesh.triangles) > 0:
                 print("Это mesh файл")

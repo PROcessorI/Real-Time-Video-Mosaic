@@ -66,20 +66,32 @@ class MonocularDepthEstimator:
     """
     Монокулярная оценка глубины с использованием различных моделей.
     
-    Доступные модели:
+     Доступные модели:
     - GLPN (vinvino02/glpn-nyu) - легкая и быстрая
     - DPT (Intel/dpt-large) - высокое качество
     - MiDaS (Intel/dpt-hybrid-midas) - хороший баланс
     - Depth Anything (LiheYoung/depth-anything-base-hf) - новейшая модель
+    - Depth Anything Small (LiheYoung/depth-anything-small-hf) - компактная версия Depth Anything
+    - Depth Anything V2 Base (depth-anything/Depth-Anything-V2-Base-hf) - улучшенная версия с лучшей точностью
+    - Depth Anything V2 Large (depth-anything/Depth-Anything-V2-Large-hf) - максимальное качество V2
+    - ZoeDepth (Intel/zoedepth-nyu-kitti) - метрическая глубина с абсолютным масштабом
+    - DepthPro (apple/DepthPro-hf) - метрическая глубина без знания intrinsics камеры
     """
     
     MODELS = {
         'glpn': 'vinvino02/glpn-nyu',
-        'dpt-large': 'Intel/dpt-large', 
+        'dpt-large': 'Intel/dpt-large',
         'midas': 'Intel/dpt-hybrid-midas',
         'depth-anything': 'LiheYoung/depth-anything-base-hf',
         'depth-anything-small': 'LiheYoung/depth-anything-small-hf',
+
+        # новые варианты
+        'depth-anything-v2-base': 'depth-anything/Depth-Anything-V2-Base-hf',
+        'depth-anything-v2-large': 'depth-anything/Depth-Anything-V2-Large-hf',
+        'zoedepth-nyu-kitti': 'Intel/zoedepth-nyu-kitti',
+        'depthpro': 'apple/DepthPro-hf',
     }
+
     
     def __init__(self, model_name: str = 'depth-anything-small'):
         """
@@ -829,6 +841,340 @@ def process_single_image(image_path: str, model_name: str = 'depth-anything-smal
     return pcd, mesh
 
 
+def estimate_camera_angles_from_images(image_paths: List[str]) -> List[float]:
+    """
+    Автоматическая оценка углов поворота камеры между изображениями.
+    
+    Использует feature matching для оценки относительного поворота.
+    """
+    print("  Автоматический расчёт углов камеры...")
+    
+    n_images = len(image_paths)
+    angles = [0.0]  # Первое изображение - 0°
+    
+    # Создаём детектор и матчер
+    orb = cv2.ORB_create(nfeatures=1000)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    
+    prev_image = cv2.imread(image_paths[0], cv2.IMREAD_GRAYSCALE)
+    if prev_image is None:
+        print("    ⚠ Не удалось загрузить первое изображение")
+        return [i * (360.0 / n_images) for i in range(n_images)]
+    
+    prev_kp, prev_desc = orb.detectAndCompute(prev_image, None)
+    
+    cumulative_angle = 0.0
+    
+    for i in range(1, n_images):
+        curr_image = cv2.imread(image_paths[i], cv2.IMREAD_GRAYSCALE)
+        if curr_image is None:
+            # Если не удалось загрузить - интерполируем
+            estimated_step = 360.0 / n_images
+            cumulative_angle += estimated_step
+            angles.append(cumulative_angle)
+            continue
+        
+        curr_kp, curr_desc = orb.detectAndCompute(curr_image, None)
+        
+        if prev_desc is None or curr_desc is None or len(prev_kp) < 10 or len(curr_kp) < 10:
+            estimated_step = 360.0 / n_images
+            cumulative_angle += estimated_step
+            angles.append(cumulative_angle)
+            prev_kp, prev_desc = curr_kp, curr_desc
+            prev_image = curr_image
+            continue
+        
+        # Сопоставление признаков
+        try:
+            matches = bf.match(prev_desc, curr_desc)
+            matches = sorted(matches, key=lambda x: x.distance)[:50]
+            
+            if len(matches) < 10:
+                estimated_step = 360.0 / n_images
+            else:
+                # Вычисляем среднее смещение по X
+                dx_sum = 0
+                for m in matches:
+                    pt1 = prev_kp[m.queryIdx].pt
+                    pt2 = curr_kp[m.trainIdx].pt
+                    dx_sum += (pt2[0] - pt1[0])
+                
+                avg_dx = dx_sum / len(matches)
+                img_width = curr_image.shape[1]
+                
+                # Оценка угла: полный оборот соответствует смещению на ширину изображения
+                # Это грубая эвристика, предполагающая панорамный обход
+                fov_horizontal = 60  # Примерное поле зрения камеры в градусах
+                estimated_step = (avg_dx / img_width) * fov_horizontal
+                
+                # Ограничиваем разумными значениями
+                estimated_step = np.clip(estimated_step, -90, 90)
+                
+                # Если смещение очень маленькое - используем равномерное
+                if abs(estimated_step) < 5:
+                    estimated_step = 360.0 / n_images
+        except:
+            estimated_step = 360.0 / n_images
+        
+        cumulative_angle += abs(estimated_step)
+        angles.append(cumulative_angle)
+        
+        prev_kp, prev_desc = curr_kp, curr_desc
+        prev_image = curr_image
+    
+    # Нормализуем углы на 360° если они сильно отличаются
+    max_angle = max(angles)
+    if max_angle > 0 and (max_angle < 180 or max_angle > 540):
+        # Масштабируем к 360°
+        scale = 360.0 / max_angle if max_angle > 0 else 1.0
+        angles = [a * scale for a in angles]
+    
+    print(f"    Рассчитанные углы: {[f'{a:.1f}°' for a in angles]}")
+    
+    return angles
+
+
+def process_multiple_images_to_3d(image_paths: List[str], 
+                                   model_name: str = 'depth-anything-v2-base',
+                                   output_dir: str = 'Data',
+                                   angles: List[float] = None,
+                                   angle_mode: str = 'auto',
+                                   visualize: bool = True):
+    """
+    Построение объёмной 3D модели из нескольких изображений объекта.
+    
+    Идея: каждое изображение снято с разного ракурса (например, обход вокруг объекта).
+    Облака точек поворачиваются на соответствующий угол и объединяются.
+    
+    Args:
+        image_paths: список путей к изображениям
+        model_name: модель для оценки глубины
+        output_dir: папка для сохранения
+        angles: углы поворота для каждого изображения (в градусах)
+        angle_mode: 'manual' - ручной ввод, 'auto' - автоматический расчёт, 'uniform' - равномерно
+        visualize: показать 3D визуализацию (Open3D)
+    """
+    print("\n" + "="*70)
+    print("ПОСТРОЕНИЕ ОБЪЁМНОЙ 3D МОДЕЛИ ИЗ НЕСКОЛЬКИХ ИЗОБРАЖЕНИЙ")
+    print("="*70)
+    
+    if len(image_paths) < 2:
+        print("Ошибка: нужно минимум 2 изображения!")
+        return None
+    
+    # Определяем углы поворота
+    n_images = len(image_paths)
+    
+    if angles is not None:
+        # Используем переданные углы
+        print(f"\nИспользуются заданные углы")
+    elif angle_mode == 'auto':
+        # Автоматический расчёт углов
+        print(f"\nРежим: АВТОМАТИЧЕСКИЙ РАСЧЁТ УГЛОВ")
+        angles = estimate_camera_angles_from_images(image_paths)
+    else:
+        # Равномерное распределение по кругу
+        print(f"\nРежим: РАВНОМЕРНОЕ РАСПРЕДЕЛЕНИЕ")
+        angles = [i * (360.0 / n_images) for i in range(n_images)]
+    
+    print(f"\nКоличество изображений: {n_images}")
+    print(f"Углы поворота: {[f'{a:.1f}°' for a in angles]}")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 1. Загрузка модели (один раз)
+    print("\n[1/4] ЗАГРУЗКА МОДЕЛИ")
+    print("-" * 40)
+    estimator = MonocularDepthEstimator(model_name)
+    
+    # 2. Обработка каждого изображения
+    print("\n[2/4] ОБРАБОТКА ИЗОБРАЖЕНИЙ")
+    print("-" * 40)
+    
+    all_pcds = []
+    
+    for i, (img_path, angle) in enumerate(zip(image_paths, angles)):
+        print(f"\n  [{i+1}/{n_images}] {os.path.basename(img_path)} (угол: {angle:.1f}°)")
+        
+        # Загрузка изображения
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"    ⚠ Не удалось загрузить, пропускаем...")
+            continue
+        
+        h, w = image.shape[:2]
+        print(f"    Размер: {w}x{h}")
+        
+        # Оценка глубины
+        depth = estimator.estimate_depth(image)
+        
+        # Нормализация глубины
+        depth_norm = depth.astype(np.float32)
+        depth_norm = (depth_norm - depth_norm.min()) / (depth_norm.max() - depth_norm.min() + 1e-8)
+        
+        # Создание облака точек
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Параметры камеры
+        fx = fy = max(w, h)
+        cx, cy = w / 2, h / 2
+        depth_scale = 5.0
+        
+        # Построение облака точек
+        u_coords, v_coords = np.meshgrid(np.arange(w), np.arange(h))
+        z = (1.0 - depth_norm) * depth_scale
+        x = (u_coords - cx) * z / fx
+        y = (v_coords - cy) * z / fy
+        
+        points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+        colors = rgb.reshape(-1, 3).astype(np.float32) / 255.0
+        
+        # Фильтрация
+        valid = (depth_norm.flatten() > 0.02) & (depth_norm.flatten() < 0.95)
+        points = points[valid]
+        colors = colors[valid]
+        
+        # Создание Open3D облака
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # Фильтрация выбросов
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.5)
+        
+        # Даунсэмплинг
+        pcd = pcd.voxel_down_sample(voxel_size=0.03)
+        
+        print(f"    Точек после обработки: {len(pcd.points)}")
+        
+        # Поворот облака на заданный угол вокруг оси Y
+        angle_rad = np.radians(angle)
+        rotation_matrix = pcd.get_rotation_matrix_from_xyz((0, angle_rad, 0))
+        pcd.rotate(rotation_matrix, center=(0, 0, 0))
+        
+        all_pcds.append(pcd)
+    
+    if len(all_pcds) == 0:
+        print("Ошибка: не удалось обработать ни одного изображения!")
+        return None
+    
+    # 3. Объединение облаков точек
+    print("\n[3/4] ОБЪЕДИНЕНИЕ ОБЛАКОВ ТОЧЕК")
+    print("-" * 40)
+    
+    # Объединяем все облака в одно
+    combined_pcd = o3d.geometry.PointCloud()
+    for pcd in all_pcds:
+        combined_pcd += pcd
+    
+    print(f"  Всего точек после объединения: {len(combined_pcd.points)}")
+    
+    # Глобальная фильтрация
+    combined_pcd, _ = combined_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=2.0)
+    print(f"  После фильтрации выбросов: {len(combined_pcd.points)}")
+    
+    # Даунсэмплинг объединённого облака
+    combined_pcd = combined_pcd.voxel_down_sample(voxel_size=0.02)
+    print(f"  После даунсэмплинга: {len(combined_pcd.points)}")
+    
+    # Сохранение облака точек
+    pcd_path = os.path.join(output_dir, "multi_view_pointcloud.ply")
+    o3d.io.write_point_cloud(pcd_path, combined_pcd)
+    print(f"  ✓ Облако сохранено: {pcd_path}")
+    
+    # 4. Генерация mesh
+    print("\n[4/4] ГЕНЕРАЦИЯ MESH")
+    print("-" * 40)
+    
+    # Оценка нормалей
+    print("  Оценка нормалей...")
+    combined_pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+    )
+    combined_pcd.orient_normals_towards_camera_location(camera_location=np.array([0., 0., -10.]))
+    
+    # Создание mesh
+    print("  Poisson реконструкция...")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        combined_pcd, depth=9
+    )
+    
+    # Удаление низкоплотных вершин
+    densities = np.asarray(densities)
+    threshold = np.quantile(densities, 0.02)
+    vertices_to_remove = densities < threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+    mesh.compute_vertex_normals()
+    
+    print(f"  ✓ Mesh: {len(mesh.vertices)} вершин, {len(mesh.triangles)} треугольников")
+    
+    # Сохранение mesh
+    mesh_path = os.path.join(output_dir, "multi_view_mesh.obj")
+    o3d.io.write_triangle_mesh(mesh_path, mesh)
+    print(f"  ✓ Mesh сохранён: {mesh_path}")
+    
+    mesh_ply_path = os.path.join(output_dir, "multi_view_mesh.ply")
+    o3d.io.write_triangle_mesh(mesh_ply_path, mesh)
+    
+    print("\n" + "="*70)
+    print("ГОТОВО!")
+    print("="*70)
+    print(f"\nФайлы:")
+    print(f"  • Облако точек: {pcd_path}")
+    print(f"  • Mesh (OBJ): {mesh_path}")
+    print(f"  • Mesh (PLY): {mesh_ply_path}")
+    
+    # Визуализация через Open3D (интерактивная)
+    if visualize and OPEN3D_AVAILABLE:
+        print("\n" + "="*70)
+        print("ИНТЕРАКТИВНАЯ 3D ВИЗУАЛИЗАЦИЯ (Open3D)")
+        print("="*70)
+        print("\nУправление:")
+        print("  • Левая кнопка мыши: вращение")
+        print("  • Колёсико: масштаб")
+        print("  • Средняя кнопка / Shift+ЛКМ: перемещение")
+        print("  • R: сброс вида")
+        print("  • Q / Esc: закрыть")
+        
+        # Создаём координатные оси для ориентации
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
+        
+        # Показываем облако точек и mesh вместе
+        print("\nВыберите что показать:")
+        print("  1. Облако точек")
+        print("  2. Mesh")
+        print("  3. Оба вместе")
+        vis_choice = input("Выбор (Enter для облака): ").strip()
+        
+        geometries = [coord_frame]
+        
+        if vis_choice == "2":
+            geometries.append(mesh)
+            title = "3D Mesh (multi-view)"
+        elif vis_choice == "3":
+            geometries.append(combined_pcd)
+            # Смещаем mesh чтобы было видно оба
+            mesh_copy = o3d.geometry.TriangleMesh(mesh)
+            mesh_copy.translate([5, 0, 0])
+            geometries.append(mesh_copy)
+            title = "Point Cloud + Mesh (multi-view)"
+        else:
+            geometries.append(combined_pcd)
+            title = "3D Point Cloud (multi-view)"
+        
+        o3d.visualization.draw_geometries(
+            geometries,
+            window_name=title,
+            width=1280,
+            height=720,
+            point_show_normal=False
+        )
+    elif visualize and not OPEN3D_AVAILABLE:
+        print("\n⚠ Open3D не установлен для визуализации")
+    
+    return combined_pcd, mesh
+
+
 def main():
     """Главная функция."""
     print("\n" + "="*70)
@@ -855,14 +1201,20 @@ def main():
     print("  2. depth-anything (средняя, ~400MB)")
     print("  3. midas (Intel DPT-Hybrid)")
     print("  4. glpn (легкая)")
+    print("  5. dpt-large (высокое качество, ~1.3GB)")
+    print("  6. depth-anything-v2-base (улучшенная v2, ~400MB)")
+    print("  7. depth-anything-v2-large (максимальное качество v2, ~1.3GB)")
+    print("  8. zoedepth-nyu-kitti (метрическая глубина)")
+    print("  9. depthpro (метрическая глубина от Apple)")
     
     print("\nВыберите действие:")
     print("  1. Обработать видео (много кадров)")
     print("  2. Обработать изображение")
     print("  3. Тест на примере")
     print("  4. Обработать видео (1 кадр - лучшее качество)")
+    print("  5. Объёмная модель из нескольких фото (multi-view)")
     
-    choice = input("\nВаш выбор (1/2/3/4): ").strip()
+    choice = input("\nВаш выбор (1/2/3/4/5): ").strip()
     
     if choice == "1":
         video_path = input("Путь к видео: ").strip()
@@ -928,6 +1280,113 @@ def main():
         cv2.imwrite(test_path, test_img)
         
         process_single_image(test_path)
+    
+    elif choice == "5":
+        # Объёмная модель из нескольких фото
+        print("\n" + "="*60)
+        print("ОБЪЁМНАЯ 3D МОДЕЛЬ ИЗ НЕСКОЛЬКИХ ФОТОГРАФИЙ")
+        print("="*60)
+        print("\nСделайте несколько фото объекта с разных сторон")
+        print("(например, обойдите вокруг него с камерой)")
+        print("\nВарианты ввода:")
+        print("  - Путь к папке с изображениями")
+        print("  - Пути к файлам через запятую")
+        print("  - Шаблон с * (например: photos/*.jpg)")
+        
+        path_input = input("\nВведите путь: ").strip()
+        
+        image_paths = []
+        
+        # Проверяем тип ввода
+        if os.path.isdir(path_input):
+            # Папка с изображениями
+            extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+            for f in sorted(os.listdir(path_input)):
+                if f.lower().endswith(extensions):
+                    image_paths.append(os.path.join(path_input, f))
+            print(f"Найдено {len(image_paths)} изображений в папке")
+            
+        elif '*' in path_input:
+            # Шаблон glob
+            import glob
+            image_paths = sorted(glob.glob(path_input))
+            print(f"Найдено {len(image_paths)} файлов по шаблону")
+            
+        elif ',' in path_input:
+            # Список путей через запятую
+            image_paths = [p.strip() for p in path_input.split(',')]
+            image_paths = [p for p in image_paths if os.path.exists(p)]
+            print(f"Указано {len(image_paths)} файлов")
+            
+        else:
+            # Один файл или неверный ввод
+            if os.path.exists(path_input):
+                print("Указан только один файл. Нужно минимум 2 изображения.")
+                print("Попробуйте указать папку или несколько файлов через запятую.")
+                return
+            else:
+                print(f"Путь не найден: {path_input}")
+                return
+        
+        if len(image_paths) < 2:
+            print("Нужно минимум 2 изображения для построения объёмной модели!")
+            return
+        
+        # Показываем найденные файлы
+        print("\nНайденные изображения:")
+        for i, p in enumerate(image_paths):
+            print(f"  {i+1}. {os.path.basename(p)}")
+        
+        # Спрашиваем про углы
+        print("\nОпределение углов поворота камеры:")
+        print("  1. Автоматический расчёт (по признакам изображений)")
+        print("  2. Равномерное распределение на 360°")
+        print("  3. Ручной ввод углов")
+        
+        angle_choice = input("\nВыбор (Enter для авто): ").strip()
+        
+        angles = None
+        angle_mode = 'auto'
+        
+        if angle_choice == "2":
+            angle_mode = 'uniform'
+            print("✓ Углы будут распределены равномерно")
+            
+        elif angle_choice == "3":
+            angle_mode = 'manual'
+            print(f"\nВведите {len(image_paths)} углов через запятую (например: 0,45,90,135,180):")
+            angles_input = input("Углы: ").strip()
+            
+            try:
+                angles = [float(a.strip()) for a in angles_input.split(',')]
+                if len(angles) != len(image_paths):
+                    print(f"⚠ Количество углов ({len(angles)}) не совпадает с количеством фото ({len(image_paths)})")
+                    print("  Переключаемся на автоматический расчёт")
+                    angles = None
+                    angle_mode = 'auto'
+                else:
+                    print(f"✓ Используются углы: {angles}")
+            except ValueError:
+                print("⚠ Неверный формат углов, используем автоматический расчёт")
+                angles = None
+                angle_mode = 'auto'
+        else:
+            print("✓ Будет выполнен автоматический расчёт углов")
+        
+        # Выбор модели
+        model = input("\nМодель (Enter для depth-anything-v2-base): ").strip()
+        if not model:
+            model = 'depth-anything-v2-base'
+        
+        # Запуск обработки
+        process_multiple_images_to_3d(
+            image_paths=image_paths,
+            model_name=model,
+            output_dir='Data',
+            angles=angles,
+            angle_mode=angle_mode,
+            visualize=True
+        )
     
     else:
         print("Неверный выбор")
