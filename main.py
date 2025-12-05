@@ -49,20 +49,19 @@ class VideMosaic:
         # Инициализировать YOLO-World для детекции машин с вида сверху (аэроснимки)
         try:
             self.model_world = YOLO('yolov8x-worldv2.pt')
-            # Устанавливаем все классы для детекции
+            # Оптимизированные классы для аэроснимков (меньше классов = точнее детекция)
             self.detection_classes = [
-                # Транспорт
-                'car', 'vehicle', 'automobile', 'van', 'truck', 'bus', 'motorcycle', 'bicycle',
+                # Транспорт (основные)
+                'car', 'truck', 'bus', 'van',
                 # Люди
-                'person', 'people', 'human', 'pedestrian',
-                # Опасности
-                'fire', 'flame', 'smoke', 'explosion',
-                # Животные
-                'dog', 'cat', 'bird', 'animal',
-                # Строения
-                'building', 'house', 'roof', 'structure',
-                # Прочее
-                'boat', 'ship', 'airplane', 'helicopter', 'drone'
+                'person',
+                # Животные (основные)
+                'dog', 'cat',
+                # Строения - фокус на крышах и зданиях с вида сверху
+                'building', 'house', 'roof', 'shed', 'barn', 'garage', 
+                'greenhouse', 'warehouse',
+                # Прочее важное
+                'pool', 'boat'
             ]
             self.model_world.set_classes(self.detection_classes)
             print("YOLO-World модель загружена для универсальной детекции объектов")
@@ -164,17 +163,17 @@ class VideMosaic:
         # Используем YOLO-World как основной детектор
         if hasattr(self, 'model_world') and self.model_world is not None:
             try:
-                # Улучшаем контраст для лучшей детекции
-                enhanced_frame = self._enhance_for_detection(frame)
+                # === Мультимасштабная детекция для лучшего обнаружения зданий ===
                 
-                # Детекция на улучшенном изображении
+                # 1. Детекция на полном изображении (высокое разрешение)
+                # Используем более высокий порог для уменьшения ложных срабатываний
                 results = self.model_world.predict(
-                    enhanced_frame,
-                    conf=0.01,      # Очень низкий порог для полноты детекции
+                    frame,
+                    conf=0.02,      # Повышенный порог для уменьшения FP
                     imgsz=1280,     # Высокое разрешение
                     verbose=False,
                     augment=True,   # Аугментация для лучшей детекции
-                    iou=0.3
+                    iou=0.5         # Повышенный IoU для лучшего NMS
                 )
                 
                 for r in results:
@@ -183,8 +182,6 @@ class VideMosaic:
                         conf = float(box.conf[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         class_name = self.model_world.names[cls_id]
-                        
-                        # Нормализуем названия классов
                         normalized_class = self._normalize_class_name(class_name)
                         
                         detections.append({
@@ -193,13 +190,14 @@ class VideMosaic:
                             'confidence': conf
                         })
                 
-                # Второй проход на оригинальном изображении для белых объектов
+                # 2. Детекция на улучшенном изображении
+                enhanced_frame = self._enhance_for_detection(frame)
                 results2 = self.model_world.predict(
-                    frame,  # Оригинал без улучшения
-                    conf=0.01,
+                    enhanced_frame,
+                    conf=0.02,      # Повышенный порог
                     imgsz=1280,
                     verbose=False,
-                    iou=0.3
+                    iou=0.5
                 )
                 
                 for r in results2:
@@ -210,34 +208,71 @@ class VideMosaic:
                         class_name = self.model_world.names[cls_id]
                         normalized_class = self._normalize_class_name(class_name)
                         
-                        # Проверяем, нет ли уже такой детекции
-                        is_dup = False
-                        for d in detections:
-                            dx1, dy1, dx2, dy2 = d['box']
-                            # Если центры близко - дубликат
-                            c1 = ((x1+x2)/2, (y1+y2)/2)
-                            c2 = ((dx1+dx2)/2, (dy1+dy2)/2)
-                            dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
-                            if dist < 30:
-                                is_dup = True
-                                break
-                        
-                        if not is_dup:
+                        if not self._is_duplicate(detections, x1, y1, x2, y2):
                             detections.append({
                                 'class': normalized_class,
                                 'box': (x1, y1, x2, y2),
                                 'confidence': conf
                             })
+                
+                # 3. Sliding window детекция для поиска зданий на больших изображениях
+                h, w = frame.shape[:2]
+                if w > 800 or h > 800:
+                    # Разбиваем на перекрывающиеся окна
+                    window_size = 640
+                    stride = 400
+                    
+                    for y_start in range(0, h - window_size // 2, stride):
+                        for x_start in range(0, w - window_size // 2, stride):
+                            x_end = min(x_start + window_size, w)
+                            y_end = min(y_start + window_size, h)
+                            
+                            if x_end - x_start < 200 or y_end - y_start < 200:
+                                continue
+                            
+                            window = frame[y_start:y_end, x_start:x_end]
+                            
+                            results_window = self.model_world.predict(
+                                window,
+                                conf=0.03,      # Повышенный порог для окон
+                                imgsz=640,
+                                verbose=False,
+                                iou=0.5
+                            )
+                            
+                            for r in results_window:
+                                for box in r.boxes:
+                                    cls_id = int(box.cls[0])
+                                    conf = float(box.conf[0])
+                                    wx1, wy1, wx2, wy2 = map(int, box.xyxy[0])
+                                    
+                                    # Преобразуем координаты обратно в глобальные
+                                    gx1 = x_start + wx1
+                                    gy1 = y_start + wy1
+                                    gx2 = x_start + wx2
+                                    gy2 = y_start + wy2
+                                    
+                                    class_name = self.model_world.names[cls_id]
+                                    normalized_class = self._normalize_class_name(class_name)
+                                    
+                                    if not self._is_duplicate(detections, gx1, gy1, gx2, gy2):
+                                        detections.append({
+                                            'class': normalized_class,
+                                            'box': (gx1, gy1, gx2, gy2),
+                                            'confidence': conf * 0.9  # Немного понижаем уверенность для sliding window
+                                        })
                         
             except Exception as e:
                 print(f"YOLO-World ошибка: {e}")
+                import traceback
+                traceback.print_exc()
                 # Fallback на стандартную YOLO если YOLO-World не работает
                 detections = self._detect_with_standard_yolo(frame)
         else:
             # Fallback на стандартную YOLO
             detections = self._detect_with_standard_yolo(frame)
         
-        # Фильтруем слишком большие детекции (убираем огромные прямоугольники)
+        # Фильтруем слишком большие и слишком маленькие детекции
         frame_area = frame.shape[0] * frame.shape[1]
         max_det_area = frame_area * 0.15  # Макс 15% кадра
         filtered_detections = []
@@ -245,9 +280,19 @@ class VideMosaic:
             w = d['box'][2] - d['box'][0]
             h = d['box'][3] - d['box'][1]
             area = w * h
-            # Убираем слишком большие (>15% кадра) и слишком маленькие (<50 пикс)
-            if 50 < area < max_det_area:
-                filtered_detections.append(d)
+            
+            # Минимальная площадь зависит от класса
+            min_area = 200 if d['class'] == 'building' else 80
+            
+            # Убираем слишком большие и слишком маленькие
+            if min_area < area < max_det_area:
+                # Дополнительно фильтруем здания по размерам
+                if d['class'] == 'building':
+                    # Здания должны быть достаточно большими
+                    if min(w, h) >= 25 and max(w, h) >= 40:
+                        filtered_detections.append(d)
+                else:
+                    filtered_detections.append(d)
         detections = filtered_detections
         
         # CV2 детекция зданий - для аэроснимков
@@ -335,8 +380,13 @@ class VideMosaic:
             return 'bird'
         elif class_name in ['animal']:
             return 'animal'
-        # Строения
-        elif class_name in ['building', 'house', 'roof', 'structure']:
+        # Строения - расширенный список
+        elif class_name in ['building', 'house', 'roof', 'structure', 'shed', 'barn', 
+                           'garage', 'greenhouse', 'warehouse', 'cottage', 'cabin', 
+                           'hut', 'shelter', 'rooftop', 'construction', 'facility',
+                           'residential building', 'metal roof', 'wooden building',
+                           'container', 'storage', 'outbuilding', 'farmhouse',
+                           'pavilion', 'canopy', 'carport', 'shack']:
             return 'building'
         # Воздушный/водный транспорт
         elif class_name in ['boat', 'ship']:
@@ -347,8 +397,44 @@ class VideMosaic:
             return 'helicopter'
         elif class_name in ['drone']:
             return 'drone'
+        elif class_name in ['pool']:
+            return 'pool'
+        elif class_name in ['tent']:
+            return 'tent'
+        elif class_name in ['solar panel']:
+            return 'solar_panel'
+        elif class_name in ['fence']:
+            return 'fence'
+        elif class_name in ['garden bed']:
+            return 'garden_bed'
         else:
             return class_name
+    
+    def _is_duplicate(self, detections, x1, y1, x2, y2, threshold=40):
+        """Проверяет, является ли детекция дубликатом существующей."""
+        for d in detections:
+            dx1, dy1, dx2, dy2 = d['box']
+            # Если центры близко - дубликат
+            c1 = ((x1+x2)/2, (y1+y2)/2)
+            c2 = ((dx1+dx2)/2, (dy1+dy2)/2)
+            dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
+            if dist < threshold:
+                return True
+            
+            # Также проверяем IoU
+            ix1 = max(x1, dx1)
+            iy1 = max(y1, dy1)
+            ix2 = min(x2, dx2)
+            iy2 = min(y2, dy2)
+            
+            if ix2 > ix1 and iy2 > iy1:
+                inter_area = (ix2 - ix1) * (iy2 - iy1)
+                area1 = (x2 - x1) * (y2 - y1)
+                area2 = (dx2 - dx1) * (dy2 - dy1)
+                iou = inter_area / (area1 + area2 - inter_area) if (area1 + area2 - inter_area) > 0 else 0
+                if iou > 0.5:
+                    return True
+        return False
     
     def _detect_with_standard_yolo(self, frame):
         """Fallback детекция со стандартной YOLO моделью."""
@@ -378,89 +464,170 @@ class VideMosaic:
         return detections
 
     def _detect_buildings_cv2(self, frame):
-        """Детекция зданий: поиск светлых прямоугольных областей (крыши).
-        
-        На аэроснимках крыши зданий выглядят как светлые однородные 
-        прямоугольные области на ЧБ изображении.
-        """
+        """Детекция зданий с watershed для разделения слипшихся областей."""
         detections = []
         
-        # Переводим в ЧБ
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
         
-        # Убираем чёрные границы мозаики  
-        _, valid_mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        # Убираем чёрные границы
+        _, valid_mask = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
         
-        # CLAHE для улучшения контраста
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray_eq = clahe.apply(gray)
+        frame_h, frame_w = gray.shape
+        frame_area = frame_h * frame_w
+        min_area = 400
+        max_area = frame_area * 0.08  # 8% после разделения
         
-        # Размытие для уменьшения шума и текстуры
-        blurred = cv2.GaussianBlur(gray_eq, (7, 7), 0)
+        # === Маска серых областей (здания) ===
+        gray_mask = cv2.inRange(s, 0, 50)
+        gray_mask = cv2.bitwise_and(gray_mask, cv2.inRange(v, 60, 220))
+        gray_mask = cv2.bitwise_and(gray_mask, valid_mask)
         
-        # Находим СВЕТЛЫЕ области (крыши светлее окружения)
-        # Адаптивный порог - инвертированный (светлое = белое)
-        adaptive = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, -5  # Отрицательный C = светлые области
-        )
+        # === Границы для разделения ===
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(blurred, 40, 120)
         
-        # Также порог по яркости
-        _, bright = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY)
+        # Толстые границы
+        kernel_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        edges_thick = cv2.dilate(edges, kernel_edge, iterations=3)
         
-        # Комбинируем
-        combined = cv2.bitwise_and(adaptive, bright)
-        combined = cv2.bitwise_and(combined, valid_mask)
+        # === WATERSHED для разделения ===
+        # Уверенный фон (то что точно НЕ здание)
+        kernel_bg = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        sure_bg = cv2.dilate(gray_mask, kernel_bg, iterations=3)
         
-        cv2.imwrite('debug_bright_areas.jpg', combined)
+        # Уверенный передний план (центры зданий)
+        dist_transform = cv2.distanceTransform(gray_mask, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+        sure_fg = np.uint8(sure_fg)
         
-        # Морфология - закрываем дыры внутри зданий, убираем мелкий шум
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close, iterations=3)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel_open, iterations=2)
+        # Неизвестная область
+        unknown = cv2.subtract(sure_bg, sure_fg)
         
-        cv2.imwrite('debug_buildings_mask.jpg', combined)
+        # Маркеры для watershed
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers = markers + 1
+        markers[unknown == 255] = 0
+        
+        # Watershed
+        frame_bgr = frame.copy()
+        markers = cv2.watershed(frame_bgr, markers)
+        
+        # Создаём маску разделённых зданий
+        buildings_separated = np.zeros_like(gray)
+        buildings_separated[markers > 1] = 255
+        
+        # Вычитаем границы watershed
+        buildings_separated[markers == -1] = 0
+        
+        # Дополнительно вычитаем Canny edges
+        buildings_separated = cv2.subtract(buildings_separated, edges_thick)
+        
+        # Морфология
+        kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        buildings_separated = cv2.morphologyEx(buildings_separated, cv2.MORPH_OPEN, kernel_clean, iterations=2)
+        
+        cv2.imwrite('debug_watershed.jpg', buildings_separated)
         
         # Находим контуры
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Максимальная площадь = 10% от кадра для зданий
-        frame_area = frame.shape[0] * frame.shape[1]
-        max_building_area = frame_area * 0.10
+        contours, _ = cv2.findContours(buildings_separated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
             
-            # Фильтр по размеру - здания могут быть большими
-            if 800 < area < max_building_area:
-                x, y, w, h = cv2.boundingRect(cnt)
-                    
-                aspect = w / h if h > 0 else 0
-                
-                # Здания обычно не сильно вытянутые
-                if 0.3 < aspect < 3.5 and min(w, h) > 20:
-                    # Проверяем прямоугольность
-                    rect_area = w * h
-                    extent = area / rect_area if rect_area > 0 else 0
-                    
-                    # Здания заполняют bounding box хотя бы на 45%
-                    if extent > 0.45:
-                        # Проверяем форму - количество углов
-                        epsilon = 0.02 * cv2.arcLength(cnt, True)
-                        approx = cv2.approxPolyDP(cnt, epsilon, True)
-                        
-                        # Прямоугольные формы имеют 4-10 углов
-                        if 4 <= len(approx) <= 12:
-                            confidence = min(0.85, extent * 0.6 + 0.35)
-                            
-                            detections.append({
-                                'class': 'building',
-                                'box': (x, y, x + w, y + h),
-                                'confidence': confidence
-                            })
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            if min(w, h) < 15:
+                continue
+            
+            rect = cv2.minAreaRect(cnt)
+            rect_area = rect[1][0] * rect[1][1]
+            if rect_area == 0:
+                continue
+            
+            rectangularity = area / rect_area
+            if rectangularity < 0.35:
+                continue
+            
+            aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+            if aspect > 5:
+                continue
+            
+            eps = 0.03 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            if len(approx) < 4:
+                continue
+            
+            if self._is_duplicate(detections, x, y, x+w, y+h, threshold=20):
+                continue
+            
+            confidence = min(0.75, rectangularity * 0.5 + 0.20)
+            
+            detections.append({
+                'class': 'building',
+                'box': (x, y, x + w, y + h),
+                'confidence': confidence
+            })
         
-        print(f"CV2 детектировал {len(detections)} зданий (светлые области)")
+        print(f"CV2 (watershed) детектировал {len(detections)} зданий")
+        return detections
+        
+        # Обрабатываем каждую маску
+        for mask_idx, mask in enumerate(all_building_masks):
+            contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                
+                if area < min_building_area or area > max_building_area:
+                    continue
+                
+                # Получаем bounding box
+                x, y, w, h = cv2.boundingRect(cnt)
+                
+                # Минимальный размер (снижен для небольших построек)
+                if min(w, h) < 25:
+                    continue
+                
+                # Aspect ratio - здания обычно не сильно вытянутые
+                aspect = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+                if aspect > 5.0:  # Увеличено для длинных зданий
+                    continue
+                
+                # Прямоугольность
+                rect_area = w * h
+                extent = area / rect_area if rect_area > 0 else 0
+                
+                # Здания заполняют bbox хотя бы на 30% (снижено)
+                if extent < 0.30:
+                    continue
+                
+                # Аппроксимируем контур
+                epsilon = 0.04 * cv2.arcLength(cnt, True)  # Увеличено для упрощения контуров
+                approx = cv2.approxPolyDP(cnt, epsilon, True)
+                
+                # Здания имеют 4-16 углов (более гибко для сложных форм)
+                if len(approx) < 4 or len(approx) > 20:
+                    continue
+                
+                # Проверяем что это не дубликат
+                if self._is_duplicate(detections, x, y, x+w, y+h, threshold=40):
+                    continue
+                
+                # Вычисляем уверенность на основе размера и прямоугольности
+                size_factor = min(1.0, area / 5000)  # Больше здание - выше уверенность
+                confidence = min(0.75, extent * 0.4 + 0.25 + size_factor * 0.1)
+                
+                detections.append({
+                    'class': 'building',
+                    'box': (x, y, x + w, y + h),
+                    'confidence': confidence
+                })
+        
+        print(f"CV2 детектировал {len(detections)} зданий (серые/светлые/тёмные крыши)")
         return detections
 
     def _detect_vehicles_cv2(self, frame):
@@ -1407,7 +1574,7 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
         
     else:
         if video_path is None:
-            video_path = 'Data/поиски квадрокоптера 2 (360p) 01.mp4'
+            video_path = 'Data/поиски квадрокоптера 2 (360p) 02.mp4'
         print(f"Открытие видеофайла: {video_path}")
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -1505,6 +1672,15 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
     # all_detections = detections + fire_smoke_detections
     all_detections = detections
     print(f"Обнаружено {len(all_detections)} объектов на мозаике.")
+    
+    # Вывод статистики по классам
+    class_counts = {}
+    for det in all_detections:
+        cls = det['class']
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+    print("Статистика по классам:")
+    for cls, count in sorted(class_counts.items(), key=lambda x: -x[1]):
+        print(f"  - {cls}: {count}")
 
     # Опционально проанализировать мозаику для навигации: отметить препятствия и нарисовать пути к объектам
     # Закомментировано создание карты навигации по запросу пользователя
