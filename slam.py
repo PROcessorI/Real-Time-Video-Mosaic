@@ -390,6 +390,327 @@ class SimpleSLAM:
         return vis
 
 
+class SLAMVisualizer:
+    """
+    Продвинутая визуализация SLAM с множественными видами.
+    """
+
+    def __init__(self):
+        self.trajectory_history = []
+        self.feature_tracks = []
+        self.pose_graph = []
+        self.map_points_history = []
+
+    def create_multi_view_visualization(self, slam_system: SimpleSLAM, current_frame: np.ndarray,
+                                       size: Tuple[int, int] = (1600, 900)) -> np.ndarray:
+        """
+        Создание комплексной визуализации с множественными видами.
+        """
+        # Создание большого холста
+        vis = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        vis.fill(30)  # Тёмно-серый фон
+
+        # Размеры подокон
+        frame_h, frame_w = current_frame.shape[:2]
+        map_size = (400, 300)
+        stats_size = (400, 200)
+        traj_3d_size = (400, 300)
+
+        # 1. Основное видео (верхний левый)
+        video_region = vis[50:50+frame_h, 50:50+frame_w]
+        video_vis = self._create_enhanced_video_view(slam_system, current_frame)
+        if video_vis.shape[0] > 0 and video_vis.shape[1] > 0:
+            video_vis_resized = cv2.resize(video_vis, (frame_w, frame_h))
+            video_region[:frame_h, :frame_w] = video_vis_resized
+
+        # 2. Карта сверху (верхний правый)
+        map_region = vis[50:50+map_size[1], 50+frame_w+50:50+frame_w+50+map_size[0]]
+        map_vis = slam_system.get_map_visualization(map_size)
+        if map_vis.shape[0] > 0 and map_vis.shape[1] > 0:
+            map_region[:map_size[1], :map_size[0]] = map_vis
+
+        # 3. Статистика (средний правый)
+        stats_region = vis[50+map_size[1]+50:50+map_size[1]+50+stats_size[1],
+                          50+frame_w+50:50+frame_w+50+stats_size[0]]
+        stats_vis = self._create_stats_dashboard(slam_system, stats_size)
+        if stats_vis.shape[0] > 0 and stats_vis.shape[1] > 0:
+            stats_region[:stats_size[1], :stats_size[0]] = stats_vis
+
+        # 4. 3D траектория (нижний левый)
+        traj_region = vis[50+frame_h+50:50+frame_h+50+traj_3d_size[1],
+                         50:50+traj_3d_size[0]]
+        traj_vis = self._create_trajectory_projection(slam_system, traj_3d_size)
+        if traj_vis.shape[0] > 0 and traj_vis.shape[1] > 0:
+            traj_region[:traj_3d_size[1], :traj_3d_size[0]] = traj_vis
+
+        # 5. Граф поз (нижний правый)
+        graph_region = vis[50+frame_h+50:50+frame_h+50+traj_3d_size[1],
+                          50+traj_3d_size[0]+50:50+traj_3d_size[0]+50+map_size[0]]
+        graph_vis = self._create_pose_graph_view(slam_system, map_size)
+        if graph_vis.shape[0] > 0 and graph_vis.shape[1] > 0:
+            graph_region[:map_size[1], :map_size[0]] = graph_vis
+
+        # Заголовки
+        cv2.putText(vis, "SLAM Real-time Visualization", (size[0]//2 - 200, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+
+        cv2.putText(vis, "Video Feed", (60, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        cv2.putText(vis, "Top View Map", (60+frame_w+50, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        cv2.putText(vis, "Statistics", (60+frame_w+50, 45+map_size[1]+50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        cv2.putText(vis, "3D Trajectory", (60, 45+frame_h+50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        cv2.putText(vis, "Pose Graph", (60+traj_3d_size[0]+50, 45+frame_h+50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+
+        return vis
+
+    def _create_enhanced_video_view(self, slam_system: SimpleSLAM, frame: np.ndarray) -> np.ndarray:
+        """Создание улучшенной видео визуализации."""
+        vis = frame.copy()
+
+        # Определение центра всегда
+        center_x, center_y = vis.shape[1] // 2, vis.shape[0] // 2
+
+        # Визуализация траектории
+        trajectory = slam_system.vo.get_trajectory()
+        if len(trajectory) > 1:
+            # Проецирование последних 50 точек
+            recent_traj = trajectory[-50:] if len(trajectory) > 50 else trajectory
+
+            for i in range(1, len(recent_traj)):
+                pt1 = (int(center_x + recent_traj[i-1][0] * 30),
+                       int(center_y + recent_traj[i-1][2] * 30))
+                pt2 = (int(center_x + recent_traj[i][0] * 30),
+                       int(center_y + recent_traj[i][2] * 30))
+
+                if (0 <= pt1[0] < vis.shape[1] and 0 <= pt1[1] < vis.shape[0] and
+                    0 <= pt2[0] < vis.shape[1] and 0 <= pt2[1] < vis.shape[0]):
+                    alpha = i / len(recent_traj)  # Градиент прозрачности
+                    color = (0, int(255 * alpha), int(255 * (1-alpha)))
+                    cv2.line(vis, pt1, pt2, color, 2)
+
+        # Текущая позиция камеры
+        if len(trajectory) > 0:
+            curr_pos = trajectory[-1]
+            pt = (int(center_x + curr_pos[0] * 30),
+                  int(center_y + curr_pos[2] * 30))
+            if 0 <= pt[0] < vis.shape[1] and 0 <= pt[1] < vis.shape[0]:
+                cv2.circle(vis, pt, 8, (0, 0, 255), -1)
+                cv2.circle(vis, pt, 12, (255, 255, 255), 2)
+
+        # Информация о статусе
+        cv2.putText(vis, f"Frame: {slam_system.stats['total_frames']}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(vis, f"Features: {slam_system.vo.prev_keypoints.shape[0] if slam_system.vo.prev_keypoints is not None else 0}", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(vis, f"FPS: {slam_system.stats['fps']:.1f}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        return vis
+
+    def _create_stats_dashboard(self, slam_system: SimpleSLAM, size: Tuple[int, int]) -> np.ndarray:
+        """Создание панели статистики."""
+        vis = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        vis.fill(50)  # Тёмно-серый фон
+
+        stats = slam_system.stats
+
+        # Заголовок
+        cv2.putText(vis, "SLAM Statistics", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Статистика
+        y_offset = 60
+        line_height = 25
+
+        cv2.putText(vis, f"Total Frames: {stats['total_frames']}", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        y_offset += line_height
+
+        cv2.putText(vis, f"Keyframes: {stats['keyframes']}", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        y_offset += line_height
+
+        cv2.putText(vis, f"Map Points: {stats['map_points']}", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        y_offset += line_height
+
+        cv2.putText(vis, f"FPS: {stats['fps']:.1f}", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        y_offset += line_height
+
+        # Визуальные индикаторы
+        # FPS бар
+        fps_ratio = min(stats['fps'] / 30.0, 1.0)  # Нормализуем к 30 FPS
+        bar_width = int(200 * fps_ratio)
+        cv2.rectangle(vis, (10, y_offset), (10 + bar_width, y_offset + 15), (0, 255, 0), -1)
+        cv2.rectangle(vis, (10, y_offset), (210, y_offset + 15), (100, 100, 100), 1)
+        cv2.putText(vis, "FPS Performance", (220, y_offset + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        return vis
+
+    def _create_trajectory_projection(self, slam_system: SimpleSLAM, size: Tuple[int, int]) -> np.ndarray:
+        """Создание 3D проекции траектории."""
+        vis = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        vis.fill(20)  # Очень тёмный фон
+
+        trajectory = slam_system.vo.get_trajectory()
+        if len(trajectory) < 2:
+            cv2.putText(vis, "Not enough trajectory data", (10, size[1]//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+            return vis
+
+        # Простая 3D проекция (изометрическая)
+        center_x, center_y = size[0] // 2, size[1] // 2
+
+        # Масштабирование
+        traj_xy = trajectory[:, [0, 2]]  # X и Z
+        min_xy = traj_xy.min(axis=0)
+        max_xy = traj_xy.max(axis=0)
+        range_xy = max_xy - min_xy
+        range_xy = np.maximum(range_xy, 0.1)
+
+        scale = min(size[0] * 0.6, size[1] * 0.6) / max(range_xy)
+
+        # Рисование траектории
+        for i in range(1, len(trajectory)):
+            # 3D проекция с высотой Y
+            x1 = center_x + (trajectory[i-1][0] - min_xy[0] - range_xy[0]/2) * scale
+            y1 = center_y + (trajectory[i-1][2] - min_xy[1] - range_xy[1]/2) * scale - trajectory[i-1][1] * scale * 0.3
+            x2 = center_x + (trajectory[i][0] - min_xy[0] - range_xy[0]/2) * scale
+            y2 = center_y + (trajectory[i][2] - min_xy[1] - range_xy[1]/2) * scale - trajectory[i][1] * scale * 0.3
+
+            pt1 = (int(x1), int(y1))
+            pt2 = (int(x2), int(y2))
+
+            if (0 <= pt1[0] < size[0] and 0 <= pt1[1] < size[1] and
+                0 <= pt2[0] < size[0] and 0 <= pt2[1] < size[1]):
+                cv2.line(vis, pt1, pt2, (0, 255, 0), 2)
+
+        # Ключевые кадры
+        for kf in slam_system.keyframes:
+            kf_pos = kf['pose'][:3, 3]
+            x = center_x + (kf_pos[0] - min_xy[0] - range_xy[0]/2) * scale
+            y = center_y + (kf_pos[2] - min_xy[1] - range_xy[1]/2) * scale - kf_pos[1] * scale * 0.3
+            pt = (int(x), int(y))
+            if 0 <= pt[0] < size[0] and 0 <= pt[1] < size[1]:
+                cv2.circle(vis, pt, 4, (255, 0, 0), -1)
+
+        # Текущая позиция
+        if len(trajectory) > 0:
+            curr = trajectory[-1]
+            x = center_x + (curr[0] - min_xy[0] - range_xy[0]/2) * scale
+            y = center_y + (curr[2] - min_xy[1] - range_xy[1]/2) * scale - curr[1] * scale * 0.3
+            pt = (int(x), int(y))
+            if 0 <= pt[0] < size[0] and 0 <= pt[1] < size[1]:
+                cv2.circle(vis, pt, 6, (0, 0, 255), -1)
+
+        cv2.putText(vis, "3D Trajectory View", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+        return vis
+
+    def _create_pose_graph_view(self, slam_system: SimpleSLAM, size: Tuple[int, int]) -> np.ndarray:
+        """Создание визуализации графа поз."""
+        vis = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+        vis.fill(30)
+
+        if len(slam_system.keyframes) < 2:
+            cv2.putText(vis, "Pose Graph", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(vis, "Not enough keyframes", (10, size[1]//2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            return vis
+
+        cv2.putText(vis, "Pose Graph", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        # Получение позиций ключевых кадров
+        kf_positions = []
+        for kf in slam_system.keyframes:
+            pos = kf['pose'][:3, 3]
+            kf_positions.append(pos)
+
+        if len(kf_positions) < 2:
+            return vis
+
+        kf_positions = np.array(kf_positions)
+
+        # Масштабирование для отображения
+        min_pos = kf_positions.min(axis=0)
+        max_pos = kf_positions.max(axis=0)
+        range_pos = max_pos - min_pos
+        range_pos = np.maximum(range_pos, 0.1)
+
+        scale = min(size[0] * 0.7, size[1] * 0.7) / max(range_pos[[0, 2]])  # X и Z
+        offset = np.array([size[0] * 0.15, size[1] * 0.85])
+
+        # Рисование ребер графа (соединения между ключевыми кадрами)
+        for i in range(1, len(kf_positions)):
+            pt1 = (int(offset[0] + (kf_positions[i-1][0] - min_pos[0]) * scale),
+                   int(offset[1] - (kf_positions[i-1][2] - min_pos[2]) * scale))
+            pt2 = (int(offset[0] + (kf_positions[i][0] - min_pos[0]) * scale),
+                   int(offset[1] - (kf_positions[i][2] - min_pos[2]) * scale))
+
+            if (0 <= pt1[0] < size[0] and 0 <= pt1[1] < size[1] and
+                0 <= pt2[0] < size[0] and 0 <= pt2[1] < size[1]):
+                cv2.line(vis, pt1, pt2, (100, 100, 100), 2)
+
+        # Рисование вершин графа (ключевые кадры)
+        for i, kf_pos in enumerate(kf_positions):
+            pt = (int(offset[0] + (kf_pos[0] - min_pos[0]) * scale),
+                  int(offset[1] - (kf_pos[2] - min_pos[2]) * scale))
+
+            if 0 <= pt[0] < size[0] and 0 <= pt[1] < size[1]:
+                # Размер круга зависит от количества ключевых точек
+                radius = 3 + min(i // 5, 5)  # Увеличивается со временем
+                cv2.circle(vis, pt, radius, (255, 255, 0), -1)
+                cv2.circle(vis, pt, radius + 2, (255, 255, 255), 1)
+
+                # Номер ключевого кадра
+                if i % 10 == 0:  # Показывать каждые 10 кадров
+                    cv2.putText(vis, str(i), (pt[0] - 10, pt[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        return vis
+
+    def visualize_feature_tracking(self, slam_system: SimpleSLAM, current_frame: np.ndarray) -> np.ndarray:
+        """
+        Визуализация отслеживания особенностей.
+        """
+        vis = current_frame.copy()
+
+        if slam_system.vo.prev_keypoints is not None and len(slam_system.vo.prev_keypoints) > 0:
+            # Рисование текущих ключевых точек
+            for kp in slam_system.vo.prev_keypoints:
+                pt = (int(kp[0][0]), int(kp[0][1]))
+                if 0 <= pt[0] < vis.shape[1] and 0 <= pt[1] < vis.shape[0]:
+                    cv2.circle(vis, pt, 3, (0, 255, 0), -1)
+
+            # Статистика
+            cv2.putText(vis, f"Tracked Features: {len(slam_system.vo.prev_keypoints)}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        return vis
+
+    def create_slam_report(self, slam_system: SimpleSLAM, trajectory: np.ndarray) -> Dict:
+        """
+        Создание отчёта о работе SLAM системы.
+        """
+        report = {
+            'total_frames': slam_system.stats['total_frames'],
+            'keyframes': slam_system.stats['keyframes'],
+            'map_points': slam_system.stats['map_points'],
+            'average_fps': slam_system.stats['fps'],
+            'trajectory_length': len(trajectory),
+            'total_distance': 0.0,
+            'loop_closures': 0,  # Заглушка
+            'tracking_quality': 'Good' if slam_system.stats['fps'] > 20 else 'Poor'
+        }
+
+        # Вычисление общей дистанции
+        if len(trajectory) > 1:
+            distances = np.linalg.norm(np.diff(trajectory, axis=0), axis=1)
+            report['total_distance'] = float(np.sum(distances))
+
+        return report
+
+
 # ============================================================
 # ИНФОРМАЦИЯ О SLAM БИБЛИОТЕКАХ
 # ============================================================
@@ -514,6 +835,7 @@ def run_slam_on_video(video_path: str, save_trajectory: bool = True):
     ], dtype=np.float32)
     
     slam = SimpleSLAM(camera_matrix)
+    visualizer = SLAMVisualizer()
     
     frame_count = 0
     paused = False
@@ -547,9 +869,13 @@ def run_slam_on_video(video_path: str, save_trajectory: bool = True):
             # Визуализация карты сверху
             map_vis = slam.get_map_visualization(size=(400, 400))
             
+            # Комплексная визуализация
+            multi_view = visualizer.create_multi_view_visualization(slam, frame, size=(1600, 900))
+            
             # Объединение визуализаций
             cv2.imshow('SLAM - Video', traj_frame)
             cv2.imshow('SLAM - Map (Top View)', map_vis)
+            cv2.imshow('SLAM - Multi-View Dashboard', multi_view)
             
             # Прогресс
             if frame_count % 50 == 0:
