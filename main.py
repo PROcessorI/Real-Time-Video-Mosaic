@@ -48,7 +48,7 @@ class VideMosaic:
         
         # Инициализировать комбинированный детектор зданий (YOLO-World + OpenCV)
         try:
-            self.building_detector = BuildingDetector('yolov8x-worldv2.pt')
+            self.building_detector = BuildingDetector('yolov8x-worldv2-visdrone-trained_25.pt')
             print("BuildingDetector загружен (YOLO-World + OpenCV комбинированный подход)")
         except Exception as e:
             print(f"Предупреждение: не удалось загрузить BuildingDetector: {e}")
@@ -1210,7 +1210,7 @@ def main(video_path=None, images_dir=None, update_callback=None, show_intermedia
         
     else:
         if video_path is None:
-            video_path = 'Data/поиски квадрокоптера 2 (360p) 02.mp4'
+            video_path = 'Data/поиски квадрокоптера 2 (360p) 01.mp4'
         print(f"Открытие видеофайла: {video_path}")
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
